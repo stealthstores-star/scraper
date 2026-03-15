@@ -392,9 +392,21 @@ def scrape_page(page, url: str) -> list[dict]:
             page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
             page.wait_for_timeout(2000)
 
-            # CAPTCHA check — raise so caller can relaunch headed
+            # CAPTCHA check — wait for user to solve it in the visible window
             if check_for_captcha(page):
-                raise CaptchaNeeded()
+                _notify_captcha()
+                log.warning(">>> CAPTCHA detected! Solve it in the browser window. <<<")
+                waited = 0
+                while waited < CAPTCHA_MAX_WAIT:
+                    time.sleep(CAPTCHA_POLL_INTERVAL)
+                    waited += CAPTCHA_POLL_INTERVAL
+                    if not check_for_captcha(page):
+                        log.info(">>> CAPTCHA solved! Continuing... <<<")
+                        page.wait_for_timeout(2000)
+                        break
+                else:
+                    log.error("CAPTCHA wait timed out after %ds", CAPTCHA_MAX_WAIT)
+                    return []
 
             dismiss_popups(page)
 
@@ -521,7 +533,7 @@ def solve_captcha_headed(pw, url: str, chrome_path: str | None):
     headed_browser.close()
 
 
-def scrape_url(pw, browser, url: str, csv_writer: LiveCSV, chrome_path: str | None):
+def scrape_url(browser, url: str, csv_writer: LiveCSV):
     url_type = classify_url(url)
     if url_type == "unknown":
         log.warning("Unknown URL type, trying generic scrape: %s", url)
@@ -537,16 +549,7 @@ def scrape_url(pw, browser, url: str, csv_writer: LiveCSV, chrome_path: str | No
             page_url = build_page_url(url, page_num) if page_num > 1 else url
             log.info("  Page %d → %s", page_num, page_url[:100])
 
-            try:
-                products = scrape_page(page, page_url)
-            except CaptchaNeeded:
-                # Close headless context, open headed window for user to solve
-                context.close()
-                solve_captcha_headed(pw, page_url, chrome_path)
-                # Reopen headless context and retry the same page
-                context = _make_context(browser)
-                page = context.new_page()
-                products = scrape_page(page, page_url)
+            products = scrape_page(page, page_url)
 
             if not products and page_num > 1:
                 log.info("  No products on page %d — done with this URL.", page_num)
@@ -614,21 +617,21 @@ def main():
 
     with sync_playwright() as pw:
         launch_args = {
-            "headless": True,
+            "headless": False,
             "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
         }
         if chrome_path:
             log.info("Using real browser: %s", chrome_path)
             launch_args["executable_path"] = chrome_path
         else:
-            log.warning("Real browser not found — using Playwright Chromium (may get CAPTCHAs)")
+            log.warning("Real browser not found — using Playwright Chromium")
 
         browser = pw.chromium.launch(**launch_args)
 
         for i, url in enumerate(urls, 1):
             log.info("[%d/%d] Scraping: %s", i, len(urls), url)
             try:
-                count = scrape_url(pw, browser, url, csv_writer, chrome_path)
+                count = scrape_url(browser, url, csv_writer)
                 log.info("[%d/%d] Got %d products (CSV total: %d)",
                          i, len(urls), count, csv_writer.count)
             except Exception as exc:
