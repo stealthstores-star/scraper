@@ -447,7 +447,10 @@ def scrape_page(page, url: str) -> list[dict]:
         except PwTimeout:
             log.warning("Timeout (attempt %d/%d)", attempt, MAX_RETRIES)
         except Exception as exc:
-            log.warning("Error (attempt %d/%d): %s", attempt, MAX_RETRIES, exc)
+            import traceback
+            log.warning("Error (attempt %d/%d): %s: %s", attempt, MAX_RETRIES,
+                        type(exc).__name__, exc)
+            log.warning("Traceback: %s", traceback.format_exc())
 
         if attempt < MAX_RETRIES:
             wait = BACKOFF_BASE * attempt
