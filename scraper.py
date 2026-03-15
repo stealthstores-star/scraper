@@ -139,9 +139,6 @@ def extract(page):
 
                 const text = card.innerText || '';
 
-                // Skip if this doesn't look like a product (no price or sales info)
-                if (!text.match(/[\\$€£¥₽]/) && !text.match(/sold/i)) continue;
-
                 processed.add(pid);
 
                 // Get image
