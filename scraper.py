@@ -355,35 +355,53 @@ def _clean_url(url):
 # ---------------------------------------------------------------------------
 
 def scroll(page):
-    # Single fast scroll to bottom and back — triggers all lazy loaders
+    # Scroll to bottom in chunks, waiting for new content to load
     page.evaluate("""
         async () => {
             const delay = ms => new Promise(r => setTimeout(r, ms));
-            const h = document.body.scrollHeight;
-            for (let y = 0; y < h; y += window.innerHeight * 3) {
-                window.scrollTo(0, y);
-                await delay(150);
+            let lastHeight = 0;
+            for (let i = 0; i < 20; i++) {
+                window.scrollTo(0, document.body.scrollHeight);
+                await delay(300);
+                const newHeight = document.body.scrollHeight;
+                if (newHeight === lastHeight) break;
+                lastHeight = newHeight;
             }
             window.scrollTo(0, 0);
         }
     """)
-    page.wait_for_timeout(200)
+    page.wait_for_timeout(300)
 
 # ---------------------------------------------------------------------------
 # Check for next page
 # ---------------------------------------------------------------------------
 
 def has_next(page, current):
-    for sel in [
-        f"a[href*='page={current + 1}']",
+    next_page = current + 1
+    selectors = [
+        f"a[href*='page={next_page}']",
+        f"a[href*='page%3D{next_page}']",
         "a[class*='next']",
         "button[aria-label='Next']",
         ".comet-pagination-next:not(.comet-pagination-disabled)",
-    ]:
+        # Pagination number links — check if next page number exists
+        f"button:has-text('{next_page}')",
+        f"a:has-text('{next_page}')",
+        "li.next a",
+        "[class*='pagination'] [class*='next']",
+    ]
+    for sel in selectors:
         try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                return True
+            els = page.query_selector_all(sel)
+            for el in els:
+                if el.is_visible():
+                    # For text-based selectors, verify it's actually the page number
+                    if sel.startswith("a:has-text") or sel.startswith("button:has-text"):
+                        txt = el.inner_text().strip()
+                        if txt == str(next_page):
+                            return True
+                    else:
+                        return True
         except Exception:
             pass
     return False
@@ -424,10 +442,10 @@ def main():
         """)
         tab = context.new_page()
 
-        # Block images, CSS, fonts, media — we only need HTML/JSON
+        # Block heavy assets — but keep stylesheets (needed for layout/pagination)
         def block_heavy(route):
             rt = route.request.resource_type
-            if rt in ("image", "font", "media", "stylesheet"):
+            if rt in ("image", "font", "media"):
                 route.abort()
             else:
                 route.continue_()
@@ -485,32 +503,31 @@ def main():
                     except Exception:
                         pass
 
-                # Scroll to load lazy content
+                # Scroll and extract — keep scrolling until no new products appear
+                # (handles both paginated and infinite-scroll pages)
                 try:
                     scroll(tab)
                 except Exception:
-                    log.info("  Page navigated during scroll, checking URL...")
-                    tab.wait_for_timeout(2000)
-                    current = tab.url.lower()
-                    if "login" in current or "passport" in current or "member" in current:
-                        log.warning(">>> Redirected to login! Log in in the browser window. <<<")
-                        print("\a", flush=True)
-                        while True:
-                            tab.wait_for_timeout(2000)
-                            current = tab.url.lower()
-                            if "login" not in current and "passport" not in current and "member" not in current:
-                                log.info(">>> Login complete! Continuing... <<<")
-                                tab.wait_for_timeout(2000)
-                                break
-                        try:
-                            tab.goto(target, wait_until="domcontentloaded", timeout=30000)
-                            tab.wait_for_timeout(3000)
-                            scroll(tab)
-                        except Exception:
-                            pass
+                    pass
 
-                # Extract
                 products = extract(tab)
+
+                # For infinite scroll pages: keep scrolling if we're getting new products
+                prev_count = len(products)
+                stale_rounds = 0
+                while stale_rounds < 3:
+                    try:
+                        tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        tab.wait_for_timeout(500)
+                    except Exception:
+                        break
+                    new_products = extract(tab)
+                    if len(new_products) > prev_count:
+                        products = new_products
+                        prev_count = len(products)
+                        stale_rounds = 0
+                    else:
+                        stale_rounds += 1
 
                 if not products and pg > 1:
                     log.info("  No products on page %d — done.", pg)
