@@ -191,18 +191,9 @@ def check_for_captcha(page) -> bool:
         return False
 
 
-def wait_for_captcha_solved(page):
-    """Wait for the user to solve a CAPTCHA, polling until it's gone."""
-    log.warning(">>> CAPTCHA detected! Solve it in the browser window. <<<")
-    waited = 0
-    while waited < CAPTCHA_MAX_WAIT:
-        time.sleep(CAPTCHA_POLL_INTERVAL)
-        waited += CAPTCHA_POLL_INTERVAL
-        if not check_for_captcha(page):
-            log.info(">>> CAPTCHA solved! Continuing... <<<")
-            page.wait_for_timeout(2000)
-            return
-    log.error("CAPTCHA wait timed out after %ds", CAPTCHA_MAX_WAIT)
+class CaptchaNeeded(Exception):
+    """Raised when a CAPTCHA is detected in headless mode."""
+    pass
 
 # ---------------------------------------------------------------------------
 # Popup dismissal
@@ -401,9 +392,9 @@ def scrape_page(page, url: str) -> list[dict]:
             page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
             page.wait_for_timeout(2000)
 
-            # CAPTCHA check
+            # CAPTCHA check — raise so caller can relaunch headed
             if check_for_captcha(page):
-                wait_for_captcha_solved(page)
+                raise CaptchaNeeded()
 
             dismiss_popups(page)
 
@@ -461,18 +452,59 @@ def has_next_page(page, current_page: int) -> bool:
 # Scrape all pages for one URL
 # ---------------------------------------------------------------------------
 
-def scrape_url(browser, url: str, csv_writer: LiveCSV):
-    url_type = classify_url(url)
-    if url_type == "unknown":
-        log.warning("Unknown URL type, trying generic scrape: %s", url)
-
-    context = browser.new_context(
+def _make_context(browser):
+    """Create a new browser context with stealth settings."""
+    ctx = browser.new_context(
         viewport={"width": 1920, "height": 1080},
         locale="en-US",
         timezone_id="America/New_York",
     )
-    # Only inject stealth JS if using Playwright's bundled browser
-    context.add_init_script(STEALTH_JS)
+    ctx.add_init_script(STEALTH_JS)
+    return ctx
+
+
+def solve_captcha_headed(pw, url: str, chrome_path: str | None):
+    """
+    Open a visible browser window on the CAPTCHA page, wait for the user
+    to solve it, then close the window and return.
+    """
+    log.warning(">>> CAPTCHA detected! Opening browser window for you to solve it... <<<")
+
+    launch_args = {
+        "headless": False,
+        "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+    }
+    if chrome_path:
+        launch_args["executable_path"] = chrome_path
+
+    headed_browser = pw.chromium.launch(**launch_args)
+    ctx = _make_context(headed_browser)
+    page = ctx.new_page()
+    page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+
+    # Wait for CAPTCHA to be solved (up to 5 minutes)
+    waited = 0
+    while waited < CAPTCHA_MAX_WAIT:
+        time.sleep(CAPTCHA_POLL_INTERVAL)
+        waited += CAPTCHA_POLL_INTERVAL
+        if not check_for_captcha(page):
+            log.info(">>> CAPTCHA solved! Closing window and resuming... <<<")
+            page.wait_for_timeout(1000)
+            ctx.close()
+            headed_browser.close()
+            return
+
+    log.error("CAPTCHA wait timed out after %ds", CAPTCHA_MAX_WAIT)
+    ctx.close()
+    headed_browser.close()
+
+
+def scrape_url(pw, browser, url: str, csv_writer: LiveCSV, chrome_path: str | None):
+    url_type = classify_url(url)
+    if url_type == "unknown":
+        log.warning("Unknown URL type, trying generic scrape: %s", url)
+
+    context = _make_context(browser)
     page = context.new_page()
 
     page_num = 1
@@ -483,7 +515,16 @@ def scrape_url(browser, url: str, csv_writer: LiveCSV):
             page_url = build_page_url(url, page_num) if page_num > 1 else url
             log.info("  Page %d → %s", page_num, page_url[:100])
 
-            products = scrape_page(page, page_url)
+            try:
+                products = scrape_page(page, page_url)
+            except CaptchaNeeded:
+                # Close headless context, open headed window for user to solve
+                context.close()
+                solve_captcha_headed(pw, page_url, chrome_path)
+                # Reopen headless context and retry the same page
+                context = _make_context(browser)
+                page = context.new_page()
+                products = scrape_page(page, page_url)
 
             if not products and page_num > 1:
                 log.info("  No products on page %d — done with this URL.", page_num)
@@ -550,24 +591,22 @@ def main():
     chrome_path = find_chrome()
 
     with sync_playwright() as pw:
+        launch_args = {
+            "headless": True,
+            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        }
         if chrome_path:
-            log.info("Using real Chrome: %s", chrome_path)
-            browser = pw.chromium.launch(
-                executable_path=chrome_path,
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-            )
+            log.info("Using real browser: %s", chrome_path)
+            launch_args["executable_path"] = chrome_path
         else:
-            log.warning("Real Chrome not found — using Playwright Chromium (may get CAPTCHAs)")
-            browser = pw.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-            )
+            log.warning("Real browser not found — using Playwright Chromium (may get CAPTCHAs)")
+
+        browser = pw.chromium.launch(**launch_args)
 
         for i, url in enumerate(urls, 1):
             log.info("[%d/%d] Scraping: %s", i, len(urls), url)
             try:
-                count = scrape_url(browser, url, csv_writer)
+                count = scrape_url(pw, browser, url, csv_writer, chrome_path)
                 log.info("[%d/%d] Got %d products (CSV total: %d)",
                          i, len(urls), count, csv_writer.count)
             except Exception as exc:
