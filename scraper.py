@@ -387,10 +387,23 @@ def main():
                 try:
                     tab.goto(target, wait_until="domcontentloaded", timeout=30000)
                 except Exception as e:
-                    log.warning("  Load error: %s", e)
-                    break
+                    # Check if we landed on a CAPTCHA or login page
+                    if is_captcha(tab):
+                        log.warning(">>> CAPTCHA detected! Solve it in the browser window. <<<")
+                        print("\a", flush=True)
+                        while is_captcha(tab):
+                            tab.wait_for_timeout(2000)
+                        log.info(">>> CAPTCHA solved! Reloading... <<<")
+                        try:
+                            tab.goto(target, wait_until="domcontentloaded", timeout=30000)
+                        except Exception:
+                            log.warning("  Load error after CAPTCHA: %s", e)
+                            break
+                    else:
+                        log.warning("  Load error: %s", e)
+                        break
 
-                # Wait for content, handle login
+                # Wait for content, handle login/captcha
                 wait_ready(tab, target)
 
                 # Dismiss popups
