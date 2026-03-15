@@ -37,22 +37,44 @@ log = logging.getLogger("scraper")
 # CSV — writes rows live
 # ---------------------------------------------------------------------------
 
-class LiveCSV:
-    FIELDS = ["product_title", "price", "product_url", "source_url"]
+FIELDS = [
+    "id",
+    "product_title",
+    "product_price",
+    "product_original_price",
+    "product_discount",
+    "product_url",
+    "product_image",
+    "product_rating",
+    "store_name",
+    "store_url",
+    "store_id",
+    "total_sales",
+    "ship_from",
+    "store_member_id",
+    "trade_info",
+    "shipping",
+    "launch_time",
+    "company_name",
+    "source_url",
+]
 
+
+class LiveCSV:
     def __init__(self, path):
         self.path = path
         self.seen = set()
         self.count = 0
         self._f = open(path, "w", newline="", encoding="utf-8")
-        self._w = csv.DictWriter(self._f, fieldnames=self.FIELDS)
+        self._w = csv.DictWriter(self._f, fieldnames=FIELDS, extrasaction="ignore")
         self._w.writeheader()
         self._f.flush()
 
     def add(self, rows, source_url):
         for r in rows:
-            if r["product_url"] not in self.seen:
-                self.seen.add(r["product_url"])
+            key = r.get("product_url", "")
+            if key and key not in self.seen:
+                self.seen.add(key)
                 r["source_url"] = source_url
                 self._w.writerow(r)
                 self.count += 1
@@ -75,6 +97,15 @@ def page_url(url, page_num):
 # Extract products from page
 # ---------------------------------------------------------------------------
 
+def _get(d, *keys):
+    """Get first non-empty value from dict using multiple possible keys."""
+    for k in keys:
+        v = d.get(k)
+        if v is not None and v != "":
+            return v
+    return ""
+
+
 def extract(page):
     products = []
     seen = set()
@@ -82,6 +113,7 @@ def extract(page):
     # Try JSON first (embedded in page source)
     try:
         html = page.content()
+        # Find all JSON arrays that look like product lists
         for pat in [
             r'"items"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
             r'"itemList"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
@@ -102,7 +134,7 @@ def extract(page):
     if products:
         return products
 
-    # Fallback: DOM links
+    # Fallback: DOM links (less data available)
     try:
         links = page.query_selector_all("a[href*='/item/']")
         for el in links:
@@ -120,23 +152,115 @@ def extract(page):
 
 
 def _from_json(item):
-    title = item.get("title") or item.get("productTitle") or item.get("name") or ""
+    """Extract all available fields from a JSON product object."""
+    title = _get(item, "title", "productTitle", "name", "subject")
     if not title:
         return None
-    price = item.get("price") or item.get("salePrice") or item.get("minPrice") or item.get("formattedPrice") or "N/A"
-    if isinstance(price, dict):
-        price = price.get("formattedPrice") or price.get("minPrice") or "N/A"
-    pid = str(item.get("productId") or item.get("itemId") or item.get("id") or item.get("productDetailUrl") or "")
+
+    # Product ID and URL
+    pid = str(_get(item, "productId", "itemId", "id", "productDetailUrl") or "")
     if pid.startswith("http"):
-        url = _clean_url(pid)
+        product_url = _clean_url(pid)
     elif pid.isdigit():
-        url = f"https://www.aliexpress.com/item/{pid}.html"
+        product_url = f"https://www.aliexpress.com/item/{pid}.html"
     else:
         return None
-    return {"product_title": title.strip(), "price": str(price), "product_url": url}
+
+    # Price fields
+    sale_price = _get(item, "price", "salePrice", "minPrice", "formattedPrice")
+    if isinstance(sale_price, dict):
+        sale_price = _get(sale_price, "formattedPrice", "minPrice", "value")
+    sale_price = str(sale_price) if sale_price else "N/A"
+
+    orig_price = _get(item, "originalPrice", "oriMinPrice", "oriMaxPrice")
+    if isinstance(orig_price, dict):
+        orig_price = _get(orig_price, "formattedPrice", "minPrice", "value")
+    orig_price = str(orig_price) if orig_price else ""
+
+    discount = _get(item, "discount", "discountRate", "discountRatio", "salePercent")
+    discount = str(discount) if discount else ""
+
+    # Image
+    image = _get(item, "image", "imageUrl", "imgUrl", "productImage", "pic")
+    if isinstance(image, dict):
+        image = _get(image, "imgUrl", "imageUrl", "url")
+    image = str(image) if image else ""
+    if image and image.startswith("//"):
+        image = "https:" + image
+
+    # Rating
+    rating = _get(item, "averageStar", "averageStarRate", "starRating",
+                  "evaluation", "evaluationScore", "rating")
+    rating = str(rating) if rating else ""
+
+    # Store info
+    store = item.get("store") or {}
+    if isinstance(store, dict):
+        store_name = _get(store, "storeName", "name", "aliMemberId") or _get(item, "storeName", "shopName")
+        store_id = str(_get(store, "storeId", "id", "shopId") or _get(item, "storeId", "shopId") or "")
+        store_member_id = str(_get(store, "aliMemberId", "memberId") or _get(item, "sellerMemberId", "aliMemberId") or "")
+        company_name = _get(store, "companyName", "company") or _get(item, "companyName") or ""
+    else:
+        store_name = _get(item, "storeName", "shopName") or ""
+        store_id = str(_get(item, "storeId", "shopId") or "")
+        store_member_id = str(_get(item, "sellerMemberId", "aliMemberId") or "")
+        company_name = _get(item, "companyName") or ""
+
+    store_url = ""
+    if store_id:
+        store_url = f"https://www.aliexpress.com/store/{store_id}"
+
+    # Sales
+    total_sales = _get(item, "totalSales", "sold", "totalOrders", "tradeCount",
+                       "totalTradCount", "orderCount")
+    total_sales = str(total_sales) if total_sales else ""
+
+    # Trade info (e.g. "500+ sold")
+    trade_info = _get(item, "tradeDesc", "trade", "tradeInfo", "salesInfo")
+    if isinstance(trade_info, dict):
+        trade_info = _get(trade_info, "tradeDesc", "text", "value")
+    trade_info = str(trade_info) if trade_info else ""
+
+    # Shipping
+    shipping = _get(item, "shippingInfo", "shipping", "logisticsDesc", "freeShipping")
+    if isinstance(shipping, dict):
+        shipping = _get(shipping, "desc", "text", "value", "logisticsDesc")
+    if isinstance(shipping, bool):
+        shipping = "Free Shipping" if shipping else ""
+    shipping = str(shipping) if shipping else ""
+
+    # Ship from
+    ship_from = _get(item, "shipFrom", "shipFromCountry", "originCountry")
+    ship_from = str(ship_from) if ship_from else ""
+
+    # Launch time
+    launch_time = _get(item, "launchTime", "createTime", "gmtCreate")
+    launch_time = str(launch_time) if launch_time else ""
+
+    return {
+        "id": pid if pid.isdigit() else "",
+        "product_title": str(title).strip(),
+        "product_price": sale_price,
+        "product_original_price": str(orig_price),
+        "product_discount": str(discount),
+        "product_url": product_url,
+        "product_image": str(image),
+        "product_rating": str(rating),
+        "store_name": str(store_name) if store_name else "",
+        "store_url": store_url,
+        "store_id": store_id,
+        "total_sales": str(total_sales),
+        "ship_from": str(ship_from),
+        "store_member_id": store_member_id,
+        "trade_info": str(trade_info),
+        "shipping": str(shipping),
+        "launch_time": str(launch_time),
+        "company_name": str(company_name),
+    }
 
 
 def _from_link(el):
+    """Fallback: extract what we can from DOM elements."""
     href = el.get_attribute("href") or ""
     if "/item/" not in href:
         return None
@@ -144,7 +268,12 @@ def _from_link(el):
         href = "https:" + href
     elif href.startswith("/"):
         href = "https://www.aliexpress.com" + href
-    url = _clean_url(href)
+    product_url = _clean_url(href)
+
+    # Extract product ID from URL
+    pid_match = re.search(r"/item/(\d+)\.html", product_url)
+    pid = pid_match.group(1) if pid_match else ""
+
     title = None
     for sel in ["h1", "h3", "h2", "[class*='title']", "[class*='Title']"]:
         te = el.query_selector(sel)
@@ -166,6 +295,15 @@ def _from_link(el):
             pass
     if not title:
         return None
+
+    # Image
+    image = ""
+    img_el = el.query_selector("img")
+    if img_el:
+        image = img_el.get_attribute("src") or ""
+        if image.startswith("//"):
+            image = "https:" + image
+
     price = None
     for sel in ["[class*='price']", "[class*='Price']"]:
         pe = el.query_selector(sel)
@@ -183,7 +321,27 @@ def _from_link(el):
                 price = m.group(0).strip()
         except Exception:
             pass
-    return {"product_title": title, "price": price or "N/A", "product_url": url}
+
+    return {
+        "id": pid,
+        "product_title": title,
+        "product_price": price or "N/A",
+        "product_original_price": "",
+        "product_discount": "",
+        "product_url": product_url,
+        "product_image": image,
+        "product_rating": "",
+        "store_name": "",
+        "store_url": "",
+        "store_id": "",
+        "total_sales": "",
+        "ship_from": "",
+        "store_member_id": "",
+        "trade_info": "",
+        "shipping": "",
+        "launch_time": "",
+        "company_name": "",
+    }
 
 
 def _clean_url(url):
@@ -245,7 +403,6 @@ def main():
     log.info("Output: %s", out)
 
     with sync_playwright() as pw:
-        # Use Playwright's own Chromium, headed, with stealth flag
         browser = pw.chromium.launch(
             headless=False,
             args=["--disable-blink-features=AutomationControlled"],
@@ -254,7 +411,6 @@ def main():
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
         )
-        # Hide webdriver flag
         context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         """)
@@ -274,18 +430,18 @@ def main():
                     log.warning("  Load error: %s", e)
                     break
 
-                # Wait for page to settle — use networkidle for better reliability
+                # Wait for page to settle
                 try:
                     tab.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
                     pass
                 tab.wait_for_timeout(2000)
 
-                # Check if we got redirected to login — wait for user to log in
+                # Check if redirected to login
                 current = tab.url.lower()
                 if "login" in current or "passport" in current or "member" in current:
                     log.warning(">>> Redirected to login! Log in in the browser window. <<<")
-                    print("\a", flush=True)  # beep
+                    print("\a", flush=True)
                     while True:
                         tab.wait_for_timeout(2000)
                         current = tab.url.lower()
@@ -293,7 +449,6 @@ def main():
                             log.info(">>> Login complete! Continuing... <<<")
                             tab.wait_for_timeout(2000)
                             break
-                    # Reload the original target after login
                     try:
                         tab.goto(target, wait_until="domcontentloaded", timeout=30000)
                     except Exception:
@@ -315,7 +470,6 @@ def main():
                 try:
                     scroll(tab)
                 except Exception:
-                    # Page may have navigated mid-scroll (login redirect etc)
                     log.info("  Page navigated during scroll, checking URL...")
                     tab.wait_for_timeout(2000)
                     current = tab.url.lower()
