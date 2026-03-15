@@ -485,20 +485,18 @@ def solve_captcha_headed(pw, url: str, chrome_path: str | None):
     log.warning(">>> CAPTCHA detected! Opening browser window — solve it there. <<<")
     _notify_captcha()
 
-    launch_args = {
-        "headless": False,
-        "args": [
+    # Use Playwright's bundled Chromium for the CAPTCHA window — the user's
+    # real browser (Edge) may already be running and macOS won't allow a
+    # second instance. Playwright Chromium is a separate binary so it always works.
+    headed_browser = pw.chromium.launch(
+        headless=False,
+        args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
-            "--auto-open-devtools-for-tabs=false",
             "--window-position=100,100",
             "--window-size=1200,900",
         ],
-    }
-    if chrome_path:
-        launch_args["executable_path"] = chrome_path
-
-    headed_browser = pw.chromium.launch(**launch_args)
+    )
     ctx = _make_context(headed_browser)
     page = ctx.new_page()
     page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
