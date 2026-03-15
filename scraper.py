@@ -179,21 +179,44 @@ def build_page_url(url: str, page: int) -> str:
 # ---------------------------------------------------------------------------
 
 def check_for_captcha(page) -> bool:
-    """Return True if the current page is a CAPTCHA challenge."""
+    """Return True if the current page is a CAPTCHA challenge page."""
     try:
-        body = page.inner_text("body")
-        lower = body.lower()
-        return any(phrase in lower for phrase in [
-            "robot", "captcha", "verify you", "slide to verify",
-            "check if you are", "unusual traffic", "security check",
-        ])
+        # Check page title first — CAPTCHA pages have distinct titles
+        title = page.title().lower()
+        if any(word in title for word in ["captcha", "verify", "robot", "security"]):
+            return True
+
+        # Check for CAPTCHA-specific elements
+        for sel in [
+            "iframe[src*='captcha']",
+            "div[id*='captcha']",
+            "div[class*='captcha']",
+            "div[class*='baxia']",
+        ]:
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    return True
+            except Exception:
+                pass
+
+        # Check body text — but only match full phrases, not stray words
+        body = page.inner_text("body").lower()
+        # Only flag as CAPTCHA if the page has very little content (a real
+        # product page has lots of text, a CAPTCHA page has almost none)
+        if len(body) < 500 and any(phrase in body for phrase in [
+            "check if you are a robot",
+            "verify you are human",
+            "slide to verify",
+            "unusual traffic",
+            "security check",
+            "we need to verify",
+        ]):
+            return True
+
+        return False
     except Exception:
         return False
-
-
-class CaptchaNeeded(Exception):
-    """Raised when a CAPTCHA is detected in headless mode."""
-    pass
 
 # ---------------------------------------------------------------------------
 # Popup dismissal
