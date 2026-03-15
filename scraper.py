@@ -110,23 +110,129 @@ def extract(page):
     products = []
     seen = set()
 
-    # DOM extraction first — sees everything currently rendered on the page
-    try:
-        links = page.query_selector_all("a[href*='/item/']")
-        for el in links:
-            try:
-                p = _from_link(el)
-                if p and p["product_url"] not in seen:
-                    seen.add(p["product_url"])
-                    products.append(p)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    # Use JavaScript to extract all product data fast — avoids slow DOM queries
+    raw = page.evaluate("""
+        () => {
+            const results = [];
+            // Find all links to /item/ pages
+            const links = document.querySelectorAll('a[href*="/item/"]');
+            const processed = new Set();
 
-    # Also try JSON to fill in extra fields (rating, store info, etc.)
+            for (const link of links) {
+                const href = link.getAttribute('href') || '';
+                const match = href.match(/\\/item\\/(\\d+)\\.html/);
+                if (!match) continue;
+                const pid = match[1];
+                if (processed.has(pid)) continue;
+
+                // Walk up to find the product card container
+                let card = link;
+                for (let i = 0; i < 5; i++) {
+                    if (!card.parentElement) break;
+                    card = card.parentElement;
+                    // Stop at elements that look like product cards
+                    const cls = card.className || '';
+                    if (cls.includes('card') || cls.includes('Card') ||
+                        cls.includes('item') || cls.includes('Item') ||
+                        cls.includes('product') || cls.includes('Product')) break;
+                }
+
+                const text = card.innerText || '';
+
+                // Skip if this doesn't look like a product (no price or sales info)
+                if (!text.match(/[\\$€£¥₽]/) && !text.match(/sold/i)) continue;
+
+                processed.add(pid);
+
+                // Get image
+                const img = card.querySelector('img');
+                let image = '';
+                if (img) image = img.getAttribute('src') || img.getAttribute('data-src') || '';
+
+                // Get title — first meaningful text or img alt
+                let title = '';
+                const titleEl = card.querySelector('h1,h2,h3,[class*="title"],[class*="Title"]');
+                if (titleEl) title = titleEl.innerText.trim();
+                if (!title && img) title = (img.getAttribute('alt') || '').trim();
+                if (!title) {
+                    // Get first line of text that's not a price
+                    const lines = text.split('\\n').map(l => l.trim()).filter(l => l && !l.match(/^[\\$€£¥₽]/));
+                    if (lines.length) title = lines[0];
+                }
+
+                // Get price
+                let price = 'N/A';
+                const priceMatch = text.match(/[\\$€£¥₽]\\s?[\\d,\\.]+/);
+                if (priceMatch) price = priceMatch[0].trim();
+
+                // Get sales info
+                let sales = '';
+                const salesMatch = text.match(/(\\d[\\d,\\.]*\\+?)\\s*sold/i);
+                if (salesMatch) sales = salesMatch[0].trim();
+
+                results.push({
+                    id: pid,
+                    title: title.substring(0, 300),
+                    price: price,
+                    image: image,
+                    sales: sales,
+                    href: href,
+                });
+            }
+            return results;
+        }
+    """)
+
+    for r in raw:
+        pid = r["id"]
+        href = r["href"]
+        if href.startswith("//"):
+            href = "https:" + href
+        elif href.startswith("/"):
+            href = "https://www.aliexpress.com" + href
+        url = f"https://www.aliexpress.com/item/{pid}.html"
+
+        if url in seen:
+            continue
+        seen.add(url)
+
+        img = r.get("image", "")
+        if img.startswith("//"):
+            img = "https:" + img
+
+        products.append({
+            "id": pid,
+            "product_title": r["title"],
+            "product_price": r["price"],
+            "product_original_price": "",
+            "product_discount": "",
+            "product_url": url,
+            "product_image": img,
+            "product_rating": "",
+            "store_name": "",
+            "store_url": "",
+            "store_id": "",
+            "total_sales": r.get("sales", ""),
+            "ship_from": "",
+            "store_member_id": "",
+            "trade_info": r.get("sales", ""),
+            "shipping": "",
+            "launch_time": "",
+            "company_name": "",
+        })
+
+    # Supplement with JSON data for extra fields
+    if products:
+        _merge_json(page, products, seen)
+
+    return products
+
+
+def _merge_json(page, products, seen):
+    """Try to merge extra fields from embedded JSON into existing products."""
     try:
         html = page.content()
+        json_products = {}
         for pat in [
             r'"items"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
             r'"itemList"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
@@ -136,23 +242,26 @@ def extract(page):
                 try:
                     for item in json.loads(m.group(1)):
                         p = _from_json(item)
-                        if p and p["product_url"] not in seen:
-                            seen.add(p["product_url"])
-                            products.append(p)
-                        elif p and p["product_url"] in seen:
-                            # Merge extra JSON fields into existing DOM entry
-                            for existing in products:
-                                if existing["product_url"] == p["product_url"]:
-                                    for k, v in p.items():
-                                        if v and (not existing.get(k) or existing[k] == "N/A" or existing[k] == ""):
-                                            existing[k] = v
-                                    break
+                        if p:
+                            json_products[p["product_url"]] = p
                 except Exception:
                     pass
+
+        # Merge JSON fields into DOM products
+        for product in products:
+            jp = json_products.get(product["product_url"])
+            if jp:
+                for k, v in jp.items():
+                    if v and v != "N/A" and (not product.get(k) or product[k] == "" or product[k] == "N/A"):
+                        product[k] = v
+
+        # Add any JSON-only products not found in DOM
+        for url, jp in json_products.items():
+            if url not in seen:
+                seen.add(url)
+                products.append(jp)
     except Exception:
         pass
-
-    return products
 
 
 def _from_json(item):
