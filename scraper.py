@@ -63,6 +63,8 @@ def find_chrome() -> str | None:
 
     if system == "Darwin":  # macOS
         candidates = [
+            # Edge first since it's the user's main browser
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
             "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
@@ -73,12 +75,17 @@ def find_chrome() -> str | None:
         progfiles = os.environ.get("PROGRAMFILES", "C:\\Program Files")
         progfiles86 = os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)")
         candidates = [
+            os.path.join(progfiles86, "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(progfiles, "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(local, "Microsoft", "Edge", "Application", "msedge.exe"),
             os.path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
             os.path.join(progfiles, "Google", "Chrome", "Application", "chrome.exe"),
             os.path.join(progfiles86, "Google", "Chrome", "Application", "chrome.exe"),
         ]
     else:  # Linux
         candidates = [
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/microsoft-edge-stable",
             "/usr/bin/google-chrome",
             "/usr/bin/google-chrome-stable",
             "/usr/bin/chromium-browser",
@@ -90,7 +97,7 @@ def find_chrome() -> str | None:
             return path
 
     # Try finding via `which`
-    for name in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]:
+    for name in ["microsoft-edge", "google-chrome", "google-chrome-stable", "chromium"]:
         try:
             result = subprocess.run(["which", name], capture_output=True, text=True)
             if result.returncode == 0:
