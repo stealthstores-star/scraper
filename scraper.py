@@ -274,8 +274,27 @@ def main():
                     log.warning("  Load error: %s", e)
                     break
 
-                # Wait for page content
+                # Wait for page content and any redirects to settle
                 tab.wait_for_timeout(3000)
+
+                # Check if we got redirected to login — wait for user to log in
+                current = tab.url.lower()
+                if "login" in current or "passport" in current or "member" in current:
+                    log.warning(">>> Redirected to login! Log in in the browser window. <<<")
+                    print("\a", flush=True)  # beep
+                    while True:
+                        tab.wait_for_timeout(2000)
+                        current = tab.url.lower()
+                        if "login" not in current and "passport" not in current and "member" not in current:
+                            log.info(">>> Login complete! Continuing... <<<")
+                            tab.wait_for_timeout(2000)
+                            break
+                    # Reload the original target after login
+                    try:
+                        tab.goto(target, wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        pass
+                    tab.wait_for_timeout(3000)
 
                 # Dismiss popups
                 for sel in ["button:has-text('Accept')", "button:has-text('OK')",
@@ -289,7 +308,10 @@ def main():
                         pass
 
                 # Scroll to load lazy content
-                scroll(tab)
+                try:
+                    scroll(tab)
+                except Exception:
+                    pass  # page may have navigated, skip scroll
 
                 # Extract
                 products = extract(tab)
