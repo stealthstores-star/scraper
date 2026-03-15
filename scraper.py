@@ -609,23 +609,27 @@ def main():
                     except Exception:
                         pass
 
-                # Extract + scroll loop — scroll until no new products appear
+                # Scroll through the page in chunks to trigger all lazy loaders
+                try:
+                    tab.evaluate("""
+                        async () => {
+                            const delay = ms => new Promise(r => setTimeout(r, ms));
+                            const step = window.innerHeight;
+                            const max = document.body.scrollHeight;
+                            for (let y = 0; y <= max; y += step) {
+                                window.scrollTo(0, y);
+                                await delay(200);
+                            }
+                            // Hit the very bottom
+                            window.scrollTo(0, document.body.scrollHeight);
+                            await delay(500);
+                            window.scrollTo(0, 0);
+                        }
+                    """)
+                except Exception:
+                    pass
+
                 products = extract(tab)
-                prev_count = len(products)
-                stale = 0
-                while stale < 5:
-                    try:
-                        tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        tab.wait_for_timeout(1200)
-                    except Exception:
-                        break
-                    products = extract(tab)
-                    if len(products) > prev_count:
-                        log.info("    %d products...", len(products))
-                        prev_count = len(products)
-                        stale = 0
-                    else:
-                        stale += 1
 
                 if not products and pg > 1:
                     log.info("  No products on page %d — done.", pg)
