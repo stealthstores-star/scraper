@@ -613,14 +613,15 @@ def main():
                 products = extract(tab)
                 prev_count = len(products)
                 stale = 0
-                while stale < 3:
+                while stale < 5:
                     try:
                         tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        tab.wait_for_timeout(800)
+                        tab.wait_for_timeout(1200)
                     except Exception:
                         break
                     products = extract(tab)
                     if len(products) > prev_count:
+                        log.info("    %d products...", len(products))
                         prev_count = len(products)
                         stale = 0
                     else:
