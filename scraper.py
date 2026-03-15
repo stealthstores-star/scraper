@@ -60,14 +60,16 @@ class LiveCSV:
         added = 0
         dupes = 0
         for r in rows:
-            key = r.get("product_url", "")
-            if key and key not in self.seen:
-                self.seen.add(key)
+            title = (r.get("product_title") or "").strip().lower()
+            if not title:
+                continue
+            if title not in self.seen:
+                self.seen.add(title)
                 r["source_url"] = source_url
                 self._w.writerow(r)
                 self.count += 1
                 added += 1
-            elif key:
+            else:
                 dupes += 1
         self._f.flush()
         return added, dupes
@@ -217,8 +219,35 @@ def has_next(page, current):
 # Wait for page to be ready, handle login/captcha
 # ---------------------------------------------------------------------------
 
+def is_captcha(tab):
+    """Check if the current page is showing a CAPTCHA."""
+    try:
+        url = tab.url.lower()
+        if "captcha" in url or "punch" in url or "sec.aliexpress" in url:
+            return True
+        # Check page content for CAPTCHA indicators
+        body = tab.query_selector("body")
+        if not body:
+            return False
+        text = (body.inner_text() or "").strip()
+        # Only check short pages (CAPTCHAs have minimal text)
+        if len(text) < 500:
+            low = text.lower()
+            if any(w in low for w in ["captcha", "verify", "robot", "slider", "puzzle", "human"]):
+                return True
+        # Check for common CAPTCHA elements
+        for sel in ["#captcha", "[class*='captcha']", "[class*='Captcha']",
+                     "#nc_1_n1z", ".nc-container", ".slider", "#baxia-dialog"]:
+            el = tab.query_selector(sel)
+            if el and el.is_visible():
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def wait_ready(tab, target):
-    """Wait for page to load, handle login redirects. Returns True if ready."""
+    """Wait for page to load, handle login redirects and CAPTCHAs."""
     # Wait for first product link to appear
     try:
         tab.wait_for_selector("a[href*='/item/']", timeout=10000)
@@ -226,19 +255,17 @@ def wait_ready(tab, target):
         pass
 
     # Check for login redirect
-    for _ in range(2):  # check twice in case of delayed redirect
+    for _ in range(2):
         current = tab.url.lower()
         if "login" in current or "passport" in current:
             log.warning(">>> Login required! Log in in the browser window. <<<")
             print("\a", flush=True)
-            # Wait for user to log in
             while True:
                 tab.wait_for_timeout(2000)
                 current = tab.url.lower()
                 if "login" not in current and "passport" not in current:
                     log.info(">>> Login complete! Reloading target... <<<")
                     break
-            # Reload original target
             try:
                 tab.goto(target, wait_until="domcontentloaded", timeout=30000)
                 tab.wait_for_selector("a[href*='/item/']", timeout=10000)
@@ -246,6 +273,20 @@ def wait_ready(tab, target):
                 pass
             return True
         tab.wait_for_timeout(500)
+
+    # Check for CAPTCHA — wait for user to solve it
+    if is_captcha(tab):
+        log.warning(">>> CAPTCHA detected! Solve it in the browser window. <<<")
+        print("\a", flush=True)
+        while is_captcha(tab):
+            tab.wait_for_timeout(2000)
+        log.info(">>> CAPTCHA solved! Reloading target... <<<")
+        # Reload original target after CAPTCHA
+        try:
+            tab.goto(target, wait_until="domcontentloaded", timeout=30000)
+            tab.wait_for_selector("a[href*='/item/']", timeout=10000)
+        except Exception:
+            pass
 
     return True
 
