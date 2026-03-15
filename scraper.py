@@ -238,29 +238,27 @@ def wait_ready(tab, target):
     """Wait for page to load, handle login redirects and CAPTCHAs."""
     # Wait for first product link to appear
     try:
-        tab.wait_for_selector("a[href*='/item/']", timeout=10000)
+        tab.wait_for_selector("a[href*='/item/']", timeout=5000)
     except Exception:
         pass
 
     # Check for login redirect
-    for _ in range(2):
-        current = tab.url.lower()
-        if "login" in current or "passport" in current:
-            log.warning(">>> Login required! Log in in the browser window. <<<")
-            print("\a", flush=True)
-            while True:
-                tab.wait_for_timeout(2000)
-                current = tab.url.lower()
-                if "login" not in current and "passport" not in current:
-                    log.info(">>> Login complete! Reloading target... <<<")
-                    break
-            try:
-                tab.goto(target, wait_until="domcontentloaded", timeout=30000)
-                tab.wait_for_selector("a[href*='/item/']", timeout=10000)
-            except Exception:
-                pass
-            return True
-        tab.wait_for_timeout(500)
+    current = tab.url.lower()
+    if "login" in current or "passport" in current:
+        log.warning(">>> Login required! Log in in the browser window. <<<")
+        print("\a", flush=True)
+        while True:
+            tab.wait_for_timeout(1000)
+            current = tab.url.lower()
+            if "login" not in current and "passport" not in current:
+                log.info(">>> Login complete! Reloading target... <<<")
+                break
+        try:
+            tab.goto(target, wait_until="domcontentloaded", timeout=30000)
+            tab.wait_for_selector("a[href*='/item/']", timeout=5000)
+        except Exception:
+            pass
+        return True
 
     # Check for CAPTCHA — wait for user to solve it
     if is_captcha(tab):
@@ -272,7 +270,7 @@ def wait_ready(tab, target):
         # Reload original target after CAPTCHA
         try:
             tab.goto(target, wait_until="domcontentloaded", timeout=30000)
-            tab.wait_for_selector("a[href*='/item/']", timeout=10000)
+            tab.wait_for_selector("a[href*='/item/']", timeout=5000)
         except Exception:
             pass
 
@@ -291,37 +289,44 @@ def dismiss_popups(tab):
             pass
 
 
+SCROLL_JS = """
+async () => {
+    const step = window.innerHeight;
+    const delay = ms => new Promise(r => setTimeout(r, ms));
+    let h = document.body.scrollHeight;
+    let y = 0;
+    while (y < h) {
+        y += step;
+        window.scrollTo(0, y);
+        await delay(150);
+        h = document.body.scrollHeight;
+    }
+    window.scrollTo(0, document.body.scrollHeight);
+    await delay(300);
+}
+"""
+
+
 def scroll_and_extract(tab):
     """Scroll through the page, extract all products."""
-    # First extraction before scrolling
     products = extract(tab)
     prev = len(products)
 
-    # Scroll down the page in viewport steps to trigger lazy loaders
+    # Single JS call scrolls entire page — much faster than round-trips
     try:
-        height = tab.evaluate("document.body.scrollHeight")
-        step = tab.evaluate("window.innerHeight")
-        y = 0
-        while y < height:
-            y += step
-            tab.evaluate(f"window.scrollTo(0, {y})")
-            tab.wait_for_timeout(200)
-        # Hit absolute bottom
-        tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        tab.wait_for_timeout(500)
+        tab.evaluate(SCROLL_JS)
     except Exception:
         pass
 
-    # Re-extract after full scroll
     products = extract(tab)
 
-    # If we got more, keep scrolling (infinite scroll pages)
+    # Infinite scroll — keep going if we're finding more
     if len(products) > prev:
         stale = 0
-        while stale < 3:
+        while stale < 2:
             try:
                 tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                tab.wait_for_timeout(1000)
+                tab.wait_for_timeout(500)
             except Exception:
                 break
             new = extract(tab)
@@ -334,7 +339,7 @@ def scroll_and_extract(tab):
     # Scroll back to top for pagination detection
     try:
         tab.evaluate("window.scrollTo(0, 0)")
-        tab.wait_for_timeout(300)
+        tab.wait_for_timeout(100)
     except Exception:
         pass
 
@@ -424,7 +429,7 @@ def main():
                     break
 
                 pg += 1
-                time.sleep(random.uniform(0.5, 1.5))
+                time.sleep(random.uniform(0.2, 0.5))
 
         context.close()
         browser.close()
