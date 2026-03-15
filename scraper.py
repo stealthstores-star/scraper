@@ -50,17 +50,26 @@ class LiveCSV:
     def __init__(self, path):
         self.path = path
         self.count = 0
+        self._seen = set()
         self._f = open(path, "w", newline="", encoding="utf-8")
         self._w = csv.DictWriter(self._f, fieldnames=FIELDS, extrasaction="ignore")
         self._w.writeheader()
         self._f.flush()
 
     def add(self, rows, source_url):
+        dupes = 0
         for r in rows:
+            pid = r.get("id", "")
+            if pid in self._seen:
+                dupes += 1
+                continue
+            self._seen.add(pid)
             r["source_url"] = source_url
             self._w.writerow(r)
             self.count += 1
         self._f.flush()
+        if dupes:
+            log.info("  Skipped %d duplicate products", dupes)
 
     def close(self):
         self._f.close()
@@ -335,9 +344,6 @@ async () => {
 
 def scroll_and_extract(tab):
     """Scroll through the page, extract all products."""
-    products = extract(tab)
-    prev = len(products)
-
     # Single JS call scrolls entire page — much faster than round-trips
     try:
         tab.evaluate(SCROLL_JS)
@@ -345,22 +351,22 @@ def scroll_and_extract(tab):
         pass
 
     products = extract(tab)
+    prev = len(products)
 
     # Infinite scroll — keep going if we're finding more
-    if len(products) > prev:
-        stale = 0
-        while stale < 2:
-            try:
-                tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                tab.wait_for_timeout(500)
-            except Exception:
-                break
-            new = extract(tab)
-            if len(new) > len(products):
-                products = new
-                stale = 0
-            else:
-                stale += 1
+    stale = 0
+    while stale < 2:
+        try:
+            tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            tab.wait_for_timeout(500)
+        except Exception:
+            break
+        new = extract(tab)
+        if len(new) > len(products):
+            products = new
+            stale = 0
+        else:
+            stale += 1
 
     # Scroll back to top for pagination detection
     try:
