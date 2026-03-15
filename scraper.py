@@ -7,19 +7,20 @@ pages using Playwright (headless Chromium). Handles pagination, deduplication,
 and exports results to a timestamped CSV.
 
 Setup:
-    pip install -r requirements.txt
-    playwright install chromium
+    pip3 install -r requirements.txt
+    python3 -m playwright install chromium
 
 Usage:
-    python scraper.py urls.txt
-    python scraper.py urls.txt -o output.csv
-    python scraper.py urls.txt --headed      # run with visible browser
+    python3 scraper.py urls.txt
+    python3 scraper.py urls.txt -o output.csv
+    python3 scraper.py urls.txt --headed      # run with visible browser
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import random
 import re
@@ -27,8 +28,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 
@@ -39,20 +39,20 @@ from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 MAX_RETRIES = 3
 BACKOFF_BASE = 4            # seconds — retry waits: 4, 8, 16
 MIN_DELAY, MAX_DELAY = 2, 5  # random delay range between page loads
-PAGE_LOAD_TIMEOUT = 60_000   # ms — max wait for network idle
+PAGE_LOAD_TIMEOUT = 60_000   # ms — max wait for page load
 MAX_PAGES = 100              # safety cap to avoid infinite pagination
 
 USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
-    "Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) "
-    "Gecko/20100101 Firefox/125.0",
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
 ]
 
 logging.basicConfig(
@@ -63,6 +63,37 @@ logging.basicConfig(
 log = logging.getLogger("aliexpress_scraper")
 
 # ---------------------------------------------------------------------------
+# Stealth JavaScript — patches navigator properties that betray automation
+# ---------------------------------------------------------------------------
+
+STEALTH_JS = """
+() => {
+    // Overwrite the 'webdriver' property on navigator
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+    // Overwrite chrome runtime to look like a real browser
+    window.chrome = { runtime: {} };
+
+    // Overwrite permissions query
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : originalQuery(parameters);
+
+    // Overwrite plugins to look non-empty
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5],
+    });
+
+    // Overwrite languages
+    Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en'],
+    });
+}
+"""
+
+# ---------------------------------------------------------------------------
 # URL helpers
 # ---------------------------------------------------------------------------
 
@@ -70,11 +101,10 @@ def classify_url(url: str) -> str:
     """Return 'search', 'store', or 'unknown'."""
     parsed = urlparse(url)
     path = parsed.path.lower()
-    if "/w/" in path or "wholesale" in path or "SearchText" in parse_qs(parsed.query):
+    if "/w/" in path or "wholesale" in path:
         return "search"
     if "/store/" in path:
         return "store"
-    # Fallback: treat category-style pages as search
     if re.search(r"/category/\d+", path):
         return "search"
     return "unknown"
@@ -84,14 +114,7 @@ def build_page_url(url: str, page: int, url_type: str) -> str:
     """Return *url* modified to request the given page number."""
     parsed = urlparse(url)
     qs = parse_qs(parsed.query, keep_blank_values=True)
-
-    if url_type == "store":
-        # Store pages use ?SearchText=&page=N  or  ?sortType=...&page=N
-        qs["page"] = [str(page)]
-    else:
-        # Search pages use &page=N
-        qs["page"] = [str(page)]
-
+    qs["page"] = [str(page)]
     new_query = urlencode(qs, doseq=True)
     return urlunparse(parsed._replace(query=new_query))
 
@@ -105,31 +128,92 @@ def random_delay():
     time.sleep(delay)
 
 
+def dismiss_popups(page):
+    """Try to close cookie consent banners and other popups."""
+    popup_selectors = [
+        # Cookie consent buttons
+        "button[data-role='gdpr-accept']",
+        "button[data-role='accept-all']",
+        "button:has-text('Accept')",
+        "button:has-text('Accept All')",
+        "button:has-text('Accept Cookies')",
+        "button:has-text('OK')",
+        "button:has-text('Got it')",
+        "button:has-text('Agree')",
+        # Close buttons on overlay modals
+        "div[class*='overlay'] button[class*='close']",
+        "div[class*='modal'] button[class*='close']",
+        "div[class*='popup'] button[class*='close']",
+        "[class*='cookie'] button",
+        # AliExpress-specific close buttons
+        ".next-dialog-close",
+        ".comet-modal-close",
+    ]
+    for sel in popup_selectors:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.click()
+                log.info("    Dismissed popup: %s", sel)
+                page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+
 def extract_products(page) -> list[dict]:
     """
     Extract product cards from the current page DOM.
-
-    AliExpress uses several card layouts; we try multiple selector strategies
-    and merge results.
+    Uses multiple strategies to find product data.
     """
     products = []
     seen_urls = set()
 
-    # Strategy: find all product link+title+price groupings.
-    # AliExpress renders cards as <a> wrappers or as divs with child <a> tags.
-    # We look for common selectors across layouts.
+    # ---- Strategy 1: Parse structured data from page scripts ----
+    # AliExpress often embeds product JSON in script tags
+    try:
+        scripts = page.query_selector_all("script")
+        for script in scripts:
+            text = script.inner_text()
+            if not text:
+                continue
+            # Look for JSON arrays with item data
+            for pattern in [
+                r'"items"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
+                r'"itemList"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
+                r'"productList"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
+            ]:
+                m = re.search(pattern, text)
+                if m:
+                    try:
+                        items = json.loads(m.group(1))
+                        for item in items:
+                            product = _parse_json_item(item)
+                            if product and product["product_url"] not in seen_urls:
+                                seen_urls.add(product["product_url"])
+                                products.append(product)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+    except Exception:
+        pass
 
+    if products:
+        log.info("    Extracted %d products from embedded JSON", len(products))
+        return products
+
+    # ---- Strategy 2: DOM-based extraction with broad selectors ----
     selectors = [
-        # Global search results (2024-2026 layout)
-        "div.search-item-card-wrapper-gallery",
+        # Search results card wrappers (2024-2026 layouts)
+        "div[class*='search-item-card']",
         "div[class*='SearchResult'] a[href*='/item/']",
-        # Unified card wrapper used on many pages
         "a.search-card-item",
-        "a[href*='/item/'][class*='card']",
         # Store page cards
-        "div.product-container",
         "div[class*='product-card']",
-        # Very generic fallback: any link whose href points to an item page
+        "div[class*='product-container']",
+        "div[class*='ProductCard']",
+        # Generic card selectors
+        "a[href*='/item/'][class*='card']",
+        "div[class*='card'] a[href*='/item/']",
+        # Very generic fallback: any link to an item page
         "a[href*='/item/']",
     ]
 
@@ -141,35 +225,71 @@ def extract_products(page) -> list[dict]:
 
         for el in elements:
             try:
-                product = _parse_card(page, el)
+                product = _parse_card(el)
                 if product and product["product_url"] not in seen_urls:
                     seen_urls.add(product["product_url"])
                     products.append(product)
             except Exception:
                 continue
 
+        # If we found products with a specific selector, stop — avoid duplicates
+        # from more generic selectors
+        if products:
+            break
+
     return products
 
 
-def _parse_card(page, el) -> dict | None:
-    """Extract title, price, and URL from a single card element."""
+def _parse_json_item(item: dict) -> dict | None:
+    """Extract product info from a JSON item object."""
+    # AliExpress JSON uses various key names
+    title = (
+        item.get("title") or item.get("productTitle") or
+        item.get("name") or item.get("subject") or ""
+    )
+    if not title:
+        return None
+
+    # Price
+    price = (
+        item.get("price") or item.get("salePrice") or
+        item.get("minPrice") or item.get("formattedPrice") or "N/A"
+    )
+    if isinstance(price, dict):
+        price = price.get("formattedPrice") or price.get("minPrice") or "N/A"
+    price = str(price)
+
+    # URL
+    product_id = str(
+        item.get("productId") or item.get("itemId") or
+        item.get("id") or item.get("productDetailUrl") or ""
+    )
+    if product_id.startswith("http"):
+        product_url = _clean_product_url(product_id)
+    elif product_id.isdigit():
+        product_url = f"https://www.aliexpress.com/item/{product_id}.html"
+    else:
+        return None
+
+    return {"product_title": title.strip(), "price": price, "product_url": product_url}
+
+
+def _parse_card(el) -> dict | None:
+    """Extract title, price, and URL from a single DOM card element."""
     # --- URL ---
     href = el.get_attribute("href")
     if not href:
-        # The element might be a wrapper div; look for the first child <a>
         link = el.query_selector("a[href*='/item/']")
         if link:
             href = link.get_attribute("href")
     if not href or "/item/" not in href:
         return None
 
-    # Normalise to absolute URL
     if href.startswith("//"):
         href = "https:" + href
     elif href.startswith("/"):
         href = "https://www.aliexpress.com" + href
 
-    # Strip tracking query params but keep the item id
     product_url = _clean_product_url(href)
 
     # --- Title ---
@@ -177,11 +297,20 @@ def _parse_card(page, el) -> dict | None:
     for sel in ["h1", "h3", "h2", "[class*='title']", "[class*='Title']", "img"]:
         title_el = el.query_selector(sel)
         if title_el:
-            title = title_el.inner_text().strip() if sel != "img" else title_el.get_attribute("alt")
+            if sel == "img":
+                title = (title_el.get_attribute("alt") or "").strip()
+            else:
+                try:
+                    title = title_el.inner_text().strip()
+                except Exception:
+                    pass
             if title:
                 break
     if not title:
-        title = el.inner_text().strip()[:200]
+        try:
+            title = el.inner_text().strip()[:200]
+        except Exception:
+            pass
     if not title:
         return None
 
@@ -195,15 +324,20 @@ def _parse_card(page, el) -> dict | None:
     ]:
         price_el = el.query_selector(sel)
         if price_el:
-            price = price_el.inner_text().strip()
+            try:
+                price = price_el.inner_text().strip()
+            except Exception:
+                pass
             if price:
                 break
-    # Sometimes the price is embedded in the card text — try regex fallback
     if not price:
-        card_text = el.inner_text()
-        m = re.search(r"[\$€£¥₽][\s]?\d[\d,\.]+", card_text)
-        if m:
-            price = m.group(0).strip()
+        try:
+            card_text = el.inner_text()
+            m = re.search(r"[\$€£¥₽]\s?\d[\d,\.]+", card_text)
+            if m:
+                price = m.group(0).strip()
+        except Exception:
+            pass
     price = price or "N/A"
 
     return {"product_title": title, "price": price, "product_url": product_url}
@@ -215,23 +349,42 @@ def _clean_product_url(url: str) -> str:
     m = re.search(r"(/item/\d+\.html)", parsed.path)
     if m:
         return f"https://www.aliexpress.com{m.group(1)}"
-    # If the URL doesn't match the pattern, return it with query params stripped
     return urlunparse(parsed._replace(query="", fragment=""))
 
 # ---------------------------------------------------------------------------
 # Page-level scraping with retries
 # ---------------------------------------------------------------------------
 
-def scrape_page_with_retries(page, url: str) -> list[dict]:
+def scrape_page_with_retries(page, url: str, debug_dir: str | None = None) -> list[dict]:
     """Load a URL in *page* and extract products, retrying on failure."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-            # Give JS extra time to render product cards
+
+            # Wait for content to render
             page.wait_for_timeout(3000)
+
+            # Dismiss cookie/consent popups
+            dismiss_popups(page)
+
+            # Try to wait for product elements to appear
+            try:
+                page.wait_for_selector(
+                    "a[href*='/item/'], div[class*='product'], div[class*='card']",
+                    timeout=10_000,
+                )
+            except PwTimeout:
+                log.info("    No product selectors found, will try JSON extraction")
+
             # Scroll down to trigger lazy-loaded cards
             _auto_scroll(page)
+
             products = extract_products(page)
+
+            # Debug: save screenshot + HTML when no products found
+            if not products and debug_dir:
+                _save_debug(page, url, debug_dir)
+
             return products
         except PwTimeout:
             log.warning("Timeout on %s (attempt %d/%d)", url, attempt, MAX_RETRIES)
@@ -245,37 +398,63 @@ def scrape_page_with_retries(page, url: str) -> list[dict]:
     return []
 
 
+def _save_debug(page, url: str, debug_dir: str):
+    """Save a screenshot and HTML dump for debugging."""
+    Path(debug_dir).mkdir(exist_ok=True)
+    ts = datetime.now().strftime("%H%M%S")
+    slug = re.sub(r"[^\w]", "_", urlparse(url).path)[:40]
+
+    screenshot_path = f"{debug_dir}/debug_{ts}_{slug}.png"
+    html_path = f"{debug_dir}/debug_{ts}_{slug}.html"
+
+    try:
+        page.screenshot(path=screenshot_path, full_page=True)
+        log.info("    Debug screenshot saved: %s", screenshot_path)
+    except Exception as exc:
+        log.warning("    Could not save screenshot: %s", exc)
+
+    try:
+        html = page.content()
+        Path(html_path).write_text(html, encoding="utf-8")
+        log.info("    Debug HTML saved: %s", html_path)
+    except Exception as exc:
+        log.warning("    Could not save HTML: %s", exc)
+
+
 def _auto_scroll(page, pause: float = 0.8, max_scrolls: int = 12):
     """Scroll the page incrementally to trigger lazy-loaded content."""
     for _ in range(max_scrolls):
         page.evaluate("window.scrollBy(0, window.innerHeight)")
         page.wait_for_timeout(int(pause * 1000))
-    # Scroll back to top (some layouts reveal a "next page" button at the top)
     page.evaluate("window.scrollTo(0, 0)")
     page.wait_for_timeout(500)
 
 
 def has_next_page(page, current_page: int) -> bool:
     """Detect whether a 'next page' element is present and clickable."""
-    # Check for next-page buttons or pagination links
     for sel in [
-        "button.next-pagination-item",          # older layout
-        "a[class*='next']",                      # generic
-        f"a[href*='page={current_page + 1}']",   # link-based pagination
+        "button.next-pagination-item",
+        "a[class*='next']",
+        f"a[href*='page={current_page + 1}']",
         "button[aria-label='Next']",
         "li.next a",
         ".comet-pagination-next:not(.comet-pagination-disabled)",
+        "nav[class*='pagination'] a:last-child",
+        "ul[class*='pagination'] li:last-child a",
     ]:
-        el = page.query_selector(sel)
-        if el and el.is_visible():
-            return True
+        try:
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                return True
+        except Exception:
+            pass
     return False
 
 # ---------------------------------------------------------------------------
 # Main scraper orchestration
 # ---------------------------------------------------------------------------
 
-def scrape_url(browser, url: str) -> list[dict]:
+def scrape_url(browser, url: str, debug_dir: str) -> list[dict]:
     """
     Scrape all pages for a single AliExpress URL.
     Returns a list of product dicts (including 'source_url').
@@ -283,14 +462,19 @@ def scrape_url(browser, url: str) -> list[dict]:
     url_type = classify_url(url)
     if url_type == "unknown":
         log.warning("Unrecognised URL type — will attempt generic scrape: %s", url)
-        url_type = "search"  # best-effort
+        url_type = "search"
 
     ua = random.choice(USER_AGENTS)
     context = browser.new_context(
         user_agent=ua,
         viewport={"width": 1920, "height": 1080},
         locale="en-US",
+        # Pretend to be a real user with timezone & geolocation
+        timezone_id="America/New_York",
     )
+    # Inject stealth scripts before any page loads
+    context.add_init_script(STEALTH_JS)
+
     page = context.new_page()
 
     all_products: list[dict] = []
@@ -301,7 +485,7 @@ def scrape_url(browser, url: str) -> list[dict]:
             page_url = build_page_url(url, current_page, url_type) if current_page > 1 else url
             log.info("  Page %d → %s", current_page, page_url)
 
-            products = scrape_page_with_retries(page, page_url)
+            products = scrape_page_with_retries(page, page_url, debug_dir)
             if not products and current_page > 1:
                 log.info("  No products found on page %d — assuming end of results.", current_page)
                 break
@@ -312,7 +496,6 @@ def scrape_url(browser, url: str) -> list[dict]:
             log.info("  Found %d products on page %d (total so far: %d)",
                      len(products), current_page, len(all_products))
 
-            # Check for next page
             if not has_next_page(page, current_page):
                 log.info("  No next page detected — done with this URL.")
                 break
@@ -392,6 +575,11 @@ def main():
         action="store_true",
         help="Run with a visible browser window (useful for debugging).",
     )
+    parser.add_argument(
+        "--debug-dir",
+        default="debug_output",
+        help="Directory for debug screenshots/HTML when 0 products found.",
+    )
     args = parser.parse_args()
 
     urls = read_urls(args.urls_file)
@@ -402,12 +590,18 @@ def main():
     all_products: list[dict] = []
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=not args.headed)
+        browser = pw.chromium.launch(
+            headless=not args.headed,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
 
         for i, url in enumerate(urls, 1):
             log.info("[%d/%d] Scraping: %s", i, len(urls), url)
             try:
-                products = scrape_url(browser, url)
+                products = scrape_url(browser, url, args.debug_dir)
                 all_products.extend(products)
                 log.info("[%d/%d] Collected %d products from this URL (running total: %d)",
                          i, len(urls), len(products), len(all_products))
@@ -421,6 +615,7 @@ def main():
         write_csv(all_products, output_path)
     else:
         log.warning("No products were scraped. CSV not created.")
+        log.warning("Check the '%s' folder for screenshots showing what the browser saw.", args.debug_dir)
 
 
 if __name__ == "__main__":
