@@ -1,0 +1,5 @@
+# Example AliExpress URLs — one per line
+# Search results pages:
+# https://www.aliexpress.com/w/wholesale-resin-model-kit.html
+# Seller store pages:
+# https://www.aliexpress.com/store/1234567/search
