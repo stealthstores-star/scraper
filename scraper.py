@@ -442,17 +442,19 @@ def main():
                 log.info("  Page %d", pg)
 
                 try:
-                    tab.goto(target, wait_until="domcontentloaded", timeout=30000)
+                    tab.goto(target, wait_until="commit", timeout=15000)
                 except Exception as e:
                     log.warning("  Load error: %s", e)
                     break
 
-                # Wait for page to settle
+                # Wait for product content to appear (fast) instead of networkidle (slow)
                 try:
-                    tab.wait_for_load_state("networkidle", timeout=8000)
+                    tab.wait_for_selector(
+                        "a[href*='/item/'], script:has-text('items'), script:has-text('productList')",
+                        timeout=6000,
+                    )
                 except Exception:
                     pass
-                tab.wait_for_timeout(500)
 
                 # Check if redirected to login
                 current = tab.url.lower()
