@@ -49,7 +49,6 @@ FIELDS = [
 class LiveCSV:
     def __init__(self, path):
         self.path = path
-        self.seen = set()
         self.count = 0
         self._f = open(path, "w", newline="", encoding="utf-8")
         self._w = csv.DictWriter(self._f, fieldnames=FIELDS, extrasaction="ignore")
@@ -57,22 +56,11 @@ class LiveCSV:
         self._f.flush()
 
     def add(self, rows, source_url):
-        added = 0
-        dupes = 0
         for r in rows:
-            title = (r.get("product_title") or "").strip().lower()
-            if not title:
-                continue
-            if title not in self.seen:
-                self.seen.add(title)
-                r["source_url"] = source_url
-                self._w.writerow(r)
-                self.count += 1
-                added += 1
-            else:
-                dupes += 1
+            r["source_url"] = source_url
+            self._w.writerow(r)
+            self.count += 1
         self._f.flush()
-        return added, dupes
 
     def close(self):
         self._f.close()
@@ -415,8 +403,8 @@ def main():
                     log.info("  No products on page %d — done.", pg)
                     break
 
-                added, dupes = csv_out.add(products, url)
-                log.info("  Page %d: %d found, %d new, %d duplicates (total: %d)", pg, len(products), added, dupes, csv_out.count)
+                csv_out.add(products, url)
+                log.info("  Page %d: %d products (total: %d)", pg, len(products), csv_out.count)
 
                 if not has_next(tab, pg):
                     log.info("  No next page — done.")
