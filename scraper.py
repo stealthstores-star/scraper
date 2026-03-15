@@ -16,6 +16,8 @@ Usage:
     python scraper.py urls.txt --headed      # run with visible browser
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import logging
@@ -25,6 +27,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
