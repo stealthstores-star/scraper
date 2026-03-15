@@ -57,6 +57,8 @@ class LiveCSV:
         self._f.flush()
 
     def add(self, rows, source_url):
+        added = 0
+        dupes = 0
         for r in rows:
             key = r.get("product_url", "")
             if key and key not in self.seen:
@@ -64,7 +66,11 @@ class LiveCSV:
                 r["source_url"] = source_url
                 self._w.writerow(r)
                 self.count += 1
+                added += 1
+            elif key:
+                dupes += 1
         self._f.flush()
+        return added, dupes
 
     def close(self):
         self._f.close()
@@ -340,14 +346,6 @@ def main():
         """)
         tab = context.new_page()
 
-        # Block fonts/media for speed — keep images (needed for CAPTCHA), JS and CSS
-        def block_heavy(route):
-            if route.request.resource_type in ("font", "media"):
-                route.abort()
-            else:
-                route.continue_()
-        tab.route("**/*", block_heavy)
-
         for i, url in enumerate(urls, 1):
             log.info("[%d/%d] %s", i, len(urls), url)
             pg = 1
@@ -376,8 +374,8 @@ def main():
                     log.info("  No products on page %d — done.", pg)
                     break
 
-                csv_out.add(products, url)
-                log.info("  Page %d: %d products (total: %d)", pg, len(products), csv_out.count)
+                added, dupes = csv_out.add(products, url)
+                log.info("  Page %d: %d found, %d new, %d duplicates (total: %d)", pg, len(products), added, dupes, csv_out.count)
 
                 if not has_next(tab, pg):
                     log.info("  No next page — done.")
