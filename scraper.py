@@ -221,10 +221,6 @@ def extract(page):
             "company_name": "",
         })
 
-    # Supplement with JSON data for extra fields
-    if products:
-        _merge_json(page, products, seen)
-
     return products
 
 
