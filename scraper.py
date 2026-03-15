@@ -3,8 +3,8 @@
 AliExpress Product Scraper
 ==========================
 Scrapes product listings from AliExpress search result pages and seller store
-pages using Playwright (headed Chromium). Handles pagination, deduplication,
-CAPTCHA pauses, and writes results to CSV in real time.
+pages using Playwright with your real Chrome browser. Handles pagination,
+deduplication, CAPTCHA pauses, and writes results to CSV in real time.
 
 Setup:
     pip3 install -r requirements.txt
@@ -13,7 +13,6 @@ Setup:
 Usage:
     python3 scraper.py urls.txt
     python3 scraper.py urls.txt -o output.csv
-    python3 scraper.py urls.txt --headless    # no browser window (may hit CAPTCHAs)
 """
 
 from __future__ import annotations
@@ -23,8 +22,10 @@ import csv
 import json
 import logging
 import os
+import platform
 import random
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -39,20 +40,11 @@ from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 
 MAX_RETRIES = 3
 BACKOFF_BASE = 3
-MIN_DELAY, MAX_DELAY = 1, 3       # shorter delays between pages
+MIN_DELAY, MAX_DELAY = 1, 3
 PAGE_LOAD_TIMEOUT = 45_000
 MAX_PAGES = 100
-CAPTCHA_POLL_INTERVAL = 2         # seconds between CAPTCHA checks
-CAPTCHA_MAX_WAIT = 300            # max 5 minutes to solve a CAPTCHA
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-]
+CAPTCHA_POLL_INTERVAL = 2
+CAPTCHA_MAX_WAIT = 300
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,7 +54,54 @@ logging.basicConfig(
 log = logging.getLogger("aliexpress_scraper")
 
 # ---------------------------------------------------------------------------
-# Stealth JS — hide automation signals
+# Find real Chrome on the system
+# ---------------------------------------------------------------------------
+
+def find_chrome() -> str | None:
+    """Find the real Chrome/Chromium executable on this machine."""
+    system = platform.system()
+
+    if system == "Darwin":  # macOS
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        ]
+    elif system == "Windows":
+        local = os.environ.get("LOCALAPPDATA", "")
+        progfiles = os.environ.get("PROGRAMFILES", "C:\\Program Files")
+        progfiles86 = os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)")
+        candidates = [
+            os.path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(progfiles, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(progfiles86, "Google", "Chrome", "Application", "chrome.exe"),
+        ]
+    else:  # Linux
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+        ]
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+
+    # Try finding via `which`
+    for name in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]:
+        try:
+            result = subprocess.run(["which", name], capture_output=True, text=True)
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            pass
+
+    return None
+
+# ---------------------------------------------------------------------------
+# Stealth JS — fallback for when using Playwright's bundled Chromium
 # ---------------------------------------------------------------------------
 
 STEALTH_JS = """
@@ -84,8 +123,6 @@ STEALTH_JS = """
 # ---------------------------------------------------------------------------
 
 class LiveCSV:
-    """Writes product rows to CSV as they are discovered (no buffering)."""
-
     FIELDS = ["product_title", "price", "product_url", "source_url"]
 
     def __init__(self, path: str):
@@ -98,7 +135,6 @@ class LiveCSV:
         self._file.flush()
 
     def add(self, products: list[dict]):
-        """Append new unique products and flush immediately."""
         for p in products:
             if p["product_url"] not in self.seen:
                 self.seen.add(p["product_url"])
@@ -132,73 +168,34 @@ def build_page_url(url: str, page: int) -> str:
     return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
 
 # ---------------------------------------------------------------------------
-# CAPTCHA detection and waiting
+# CAPTCHA detection — only opens visible window if needed
 # ---------------------------------------------------------------------------
 
-def wait_for_captcha(page) -> bool:
-    """
-    Check if we're on a CAPTCHA page. If so, print a message and wait
-    for the user to solve it manually. Returns True if CAPTCHA was detected.
-    """
-    captcha_indicators = [
-        "text=We need to verify",
-        "text=check if you are a robot",
-        "text=verify you are human",
-        "text=slide to verify",
-        "text=Please verify",
-        "iframe[src*='captcha']",
-        "div[id*='captcha']",
-        "div[class*='captcha']",
-        "div[class*='baxia']",
-    ]
-
-    detected = False
-    for sel in captcha_indicators:
-        try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                detected = True
-                break
-        except Exception:
-            pass
-
-    # Also check page title / body text
-    if not detected:
-        try:
-            body = page.inner_text("body")
-            if any(phrase in body.lower() for phrase in [
-                "robot", "captcha", "verify you", "slide to verify",
-                "check if you are", "unusual traffic",
-            ]):
-                detected = True
-        except Exception:
-            pass
-
-    if not detected:
+def check_for_captcha(page) -> bool:
+    """Return True if the current page is a CAPTCHA challenge."""
+    try:
+        body = page.inner_text("body")
+        lower = body.lower()
+        return any(phrase in lower for phrase in [
+            "robot", "captcha", "verify you", "slide to verify",
+            "check if you are", "unusual traffic", "security check",
+        ])
+    except Exception:
         return False
 
+
+def wait_for_captcha_solved(page):
+    """Wait for the user to solve a CAPTCHA, polling until it's gone."""
     log.warning(">>> CAPTCHA detected! Solve it in the browser window. <<<")
     waited = 0
     while waited < CAPTCHA_MAX_WAIT:
         time.sleep(CAPTCHA_POLL_INTERVAL)
         waited += CAPTCHA_POLL_INTERVAL
-
-        # Check if CAPTCHA is gone (page has product links or no captcha text)
-        try:
-            body = page.inner_text("body")
-            still_captcha = any(phrase in body.lower() for phrase in [
-                "robot", "captcha", "verify you", "slide to verify",
-                "check if you are",
-            ])
-            if not still_captcha:
-                log.info(">>> CAPTCHA solved! Continuing... <<<")
-                page.wait_for_timeout(2000)  # let page finish loading
-                return True
-        except Exception:
-            pass
-
+        if not check_for_captcha(page):
+            log.info(">>> CAPTCHA solved! Continuing... <<<")
+            page.wait_for_timeout(2000)
+            return
     log.error("CAPTCHA wait timed out after %ds", CAPTCHA_MAX_WAIT)
-    return True
 
 # ---------------------------------------------------------------------------
 # Popup dismissal
@@ -235,7 +232,7 @@ def extract_products(page) -> list[dict]:
     products = []
     seen_urls: set[str] = set()
 
-    # Strategy 1: JSON embedded in page scripts (fastest)
+    # Strategy 1: JSON from page source (fastest, most reliable)
     try:
         page_html = page.content()
         for pattern in [
@@ -388,23 +385,21 @@ def _clean_product_url(url: str) -> str:
     return urlunparse(parsed._replace(query="", fragment=""))
 
 # ---------------------------------------------------------------------------
-# Page scraping with CAPTCHA handling and retries
+# Page scraping
 # ---------------------------------------------------------------------------
 
 def scrape_page(page, url: str) -> list[dict]:
-    """Load URL, handle CAPTCHA, extract products. Retries on failure."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
             page.wait_for_timeout(2000)
 
-            # Check for CAPTCHA and wait for user to solve it
-            wait_for_captcha(page)
+            # CAPTCHA check
+            if check_for_captcha(page):
+                wait_for_captcha_solved(page)
 
-            # Dismiss cookie popups
             dismiss_popups(page)
 
-            # Wait briefly for product elements
             try:
                 page.wait_for_selector(
                     "a[href*='/item/'], div[class*='product'], div[class*='card']",
@@ -413,11 +408,8 @@ def scrape_page(page, url: str) -> list[dict]:
             except PwTimeout:
                 pass
 
-            # Quick scroll to load lazy content (faster than before)
             _fast_scroll(page)
-
-            products = extract_products(page)
-            return products
+            return extract_products(page)
 
         except PwTimeout:
             log.warning("Timeout (attempt %d/%d)", attempt, MAX_RETRIES)
@@ -434,7 +426,6 @@ def scrape_page(page, url: str) -> list[dict]:
 
 
 def _fast_scroll(page, max_scrolls: int = 6):
-    """Faster scroll — fewer steps, shorter pauses."""
     for _ in range(max_scrolls):
         page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
         page.wait_for_timeout(400)
@@ -464,18 +455,16 @@ def has_next_page(page, current_page: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def scrape_url(browser, url: str, csv_writer: LiveCSV):
-    """Scrape all pages for a URL, writing products to CSV in real time."""
     url_type = classify_url(url)
     if url_type == "unknown":
         log.warning("Unknown URL type, trying generic scrape: %s", url)
 
-    ua = random.choice(USER_AGENTS)
     context = browser.new_context(
-        user_agent=ua,
         viewport={"width": 1920, "height": 1080},
         locale="en-US",
         timezone_id="America/New_York",
     )
+    # Only inject stealth JS if using Playwright's bundled browser
     context.add_init_script(STEALTH_JS)
     page = context.new_page()
 
@@ -493,7 +482,6 @@ def scrape_url(browser, url: str, csv_writer: LiveCSV):
                 log.info("  No products on page %d — done with this URL.", page_num)
                 break
 
-            # Tag with source and write to CSV immediately
             for p in products:
                 p["source_url"] = url
             csv_writer.add(products)
@@ -542,8 +530,6 @@ def main():
     )
     parser.add_argument("urls_file", help="Text file with AliExpress URLs.")
     parser.add_argument("-o", "--output", default=None, help="Output CSV filename.")
-    parser.add_argument("--headless", action="store_true",
-                        help="Run without a browser window (default is headed/visible).")
     args = parser.parse_args()
 
     urls = read_urls(args.urls_file)
@@ -553,11 +539,23 @@ def main():
     csv_writer = LiveCSV(output_path)
     log.info("Writing results live to: %s", output_path)
 
+    # Use real Chrome if available — avoids CAPTCHAs entirely
+    chrome_path = find_chrome()
+
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=args.headless,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
+        if chrome_path:
+            log.info("Using real Chrome: %s", chrome_path)
+            browser = pw.chromium.launch(
+                executable_path=chrome_path,
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
+        else:
+            log.warning("Real Chrome not found — using Playwright Chromium (may get CAPTCHAs)")
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
 
         for i, url in enumerate(urls, 1):
             log.info("[%d/%d] Scraping: %s", i, len(urls), url)
