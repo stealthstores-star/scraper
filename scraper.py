@@ -110,10 +110,23 @@ def extract(page):
     products = []
     seen = set()
 
-    # Try JSON first (embedded in page source)
+    # DOM extraction first — sees everything currently rendered on the page
+    try:
+        links = page.query_selector_all("a[href*='/item/']")
+        for el in links:
+            try:
+                p = _from_link(el)
+                if p and p["product_url"] not in seen:
+                    seen.add(p["product_url"])
+                    products.append(p)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Also try JSON to fill in extra fields (rating, store info, etc.)
     try:
         html = page.content()
-        # Find all JSON arrays that look like product lists
         for pat in [
             r'"items"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
             r'"itemList"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
@@ -126,25 +139,16 @@ def extract(page):
                         if p and p["product_url"] not in seen:
                             seen.add(p["product_url"])
                             products.append(p)
+                        elif p and p["product_url"] in seen:
+                            # Merge extra JSON fields into existing DOM entry
+                            for existing in products:
+                                if existing["product_url"] == p["product_url"]:
+                                    for k, v in p.items():
+                                        if v and (not existing.get(k) or existing[k] == "N/A" or existing[k] == ""):
+                                            existing[k] = v
+                                    break
                 except Exception:
                     pass
-    except Exception:
-        pass
-
-    if products:
-        return products
-
-    # Fallback: DOM links (less data available)
-    try:
-        links = page.query_selector_all("a[href*='/item/']")
-        for el in links:
-            try:
-                p = _from_link(el)
-                if p and p["product_url"] not in seen:
-                    seen.add(p["product_url"])
-                    products.append(p)
-            except Exception:
-                pass
     except Exception:
         pass
 
@@ -511,18 +515,21 @@ def main():
                     pass
 
                 products = extract(tab)
+                log.info("    Initial extract: %d products", len(products))
 
-                # For infinite scroll pages: keep scrolling if we're getting new products
+                # Keep scrolling to load more (infinite scroll pages)
                 prev_count = len(products)
                 stale_rounds = 0
-                while stale_rounds < 3:
+                while stale_rounds < 5:
                     try:
+                        # Scroll to bottom and wait for new content
                         tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        tab.wait_for_timeout(500)
+                        tab.wait_for_timeout(1500)
                     except Exception:
                         break
                     new_products = extract(tab)
                     if len(new_products) > prev_count:
+                        log.info("    Scrolled: %d → %d products", prev_count, len(new_products))
                         products = new_products
                         prev_count = len(products)
                         stale_rounds = 0
