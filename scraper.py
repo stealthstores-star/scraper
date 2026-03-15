@@ -463,16 +463,37 @@ def _make_context(browser):
     return ctx
 
 
+def _notify_captcha():
+    """Send a macOS notification and beep to alert the user."""
+    try:
+        subprocess.run([
+            "osascript", "-e",
+            'display notification "CAPTCHA detected — solve it in the browser window!" '
+            'with title "AliExpress Scraper" sound name "Glass"'
+        ], capture_output=True, timeout=5)
+    except Exception:
+        pass
+    # Also beep the terminal
+    print("\a", end="", flush=True)
+
+
 def solve_captcha_headed(pw, url: str, chrome_path: str | None):
     """
     Open a visible browser window on the CAPTCHA page, wait for the user
     to solve it, then close the window and return.
     """
-    log.warning(">>> CAPTCHA detected! Opening browser window for you to solve it... <<<")
+    log.warning(">>> CAPTCHA detected! Opening browser window — solve it there. <<<")
+    _notify_captcha()
 
     launch_args = {
         "headless": False,
-        "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--auto-open-devtools-for-tabs=false",
+            "--window-position=100,100",
+            "--window-size=1200,900",
+        ],
     }
     if chrome_path:
         launch_args["executable_path"] = chrome_path
@@ -481,6 +502,9 @@ def solve_captcha_headed(pw, url: str, chrome_path: str | None):
     ctx = _make_context(headed_browser)
     page = ctx.new_page()
     page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+
+    # Bring window to front
+    page.bring_to_front()
 
     # Wait for CAPTCHA to be solved (up to 5 minutes)
     waited = 0
