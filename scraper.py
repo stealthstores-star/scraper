@@ -93,43 +93,69 @@ EXTRACT_JS = """
         if (processed.has(pid)) continue;
         processed.add(pid);
 
-        // Walk up to find product card
+        // Walk up max 3 levels to find the closest small card container
         let card = link;
-        for (let i = 0; i < 5; i++) {
+        for (let i = 0; i < 3; i++) {
             if (!card.parentElement) break;
-            card = card.parentElement;
-            const cls = card.className || '';
-            if (cls.includes('card') || cls.includes('Card') ||
-                cls.includes('item') || cls.includes('Item') ||
-                cls.includes('product') || cls.includes('Product')) break;
+            const p = card.parentElement;
+            // Stop if parent is too big (likely a section container)
+            if (p.querySelectorAll('a[href*="/item/"]').length > 1) break;
+            card = p;
         }
 
-        const text = card.innerText || '';
-
-        // Image
-        const img = card.querySelector('img');
+        // Image — prefer img inside the link or card
         let image = '';
-        if (img) image = img.getAttribute('src') || img.getAttribute('data-src') || '';
-
-        // Title
-        let title = '';
-        const titleEl = card.querySelector('h1,h2,h3,[class*="title"],[class*="Title"]');
-        if (titleEl) title = titleEl.innerText.trim();
-        if (!title && img) title = (img.getAttribute('alt') || '').trim();
-        if (!title) {
-            const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 3);
-            if (lines.length) title = lines[0];
+        const img = link.querySelector('img') || card.querySelector('img');
+        if (img) {
+            image = img.getAttribute('src') || img.getAttribute('data-src') || '';
+            if (image.includes('48x48') || image.includes('placeholder')) image = '';
         }
 
-        // Price
+        // Title — try multiple strategies
+        let title = '';
+        // 1. Alt text on image (usually the best on AliExpress)
+        if (img) title = (img.getAttribute('alt') || '').trim();
+        // 2. Title/aria-label on the link itself
+        if (!title) title = (link.getAttribute('title') || '').trim();
+        if (!title) title = (link.getAttribute('aria-label') || '').trim();
+        // 3. Look for title-like elements inside card
+        if (!title) {
+            const titleEl = card.querySelector('[class*="title"],[class*="Title"],h1,h2,h3');
+            if (titleEl) {
+                const t = titleEl.innerText.trim();
+                // Skip section headers
+                if (t.length > 5 && !['New arrivals','Hot deals','Related Searches','More to love'].includes(t)) {
+                    title = t;
+                }
+            }
+        }
+        // 4. Fallback: longest text line in card
+        if (!title) {
+            const text = card.innerText || '';
+            const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 10);
+            if (lines.length) title = lines.reduce((a, b) => a.length > b.length ? a : b);
+        }
+
+        // Price — look for currency + number patterns
         let price = 'N/A';
-        const pm = text.match(/[\\$€£¥₽]\\s?[\\d,\\.]+/);
-        if (pm) price = pm[0].trim();
+        const cardText = card.innerText || '';
+        // Match patterns like $5.99, US $12.30, € 8,99
+        const pm = cardText.match(/(?:US\\s*)?[\\$€£¥₽]\\s*[\\d,]+\\.?\\d*/);
+        if (pm) {
+            price = pm[0].trim();
+        } else {
+            // Try matching just numbers near currency symbols on the page
+            const pm2 = cardText.match(/\\d+[,.]\\d{2}/);
+            if (pm2) price = '$' + pm2[0];
+        }
 
         // Sales
         let sales = '';
-        const sm = text.match(/(\\d[\\d,\\.]*\\+?)\\s*sold/i);
+        const sm = cardText.match(/(\\d[\\d,\\.]*\\+?)\\s*[Ss]old/);
         if (sm) sales = sm[0].trim();
+
+        // Skip items with generic/section titles
+        if (['New arrivals','Hot deals','Related Searches','More to love',''].includes(title)) continue;
 
         results.push({ id: pid, title: title.substring(0, 300), price, image, sales, href });
     }
