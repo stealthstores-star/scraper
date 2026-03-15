@@ -355,11 +355,19 @@ def _clean_url(url):
 # ---------------------------------------------------------------------------
 
 def scroll(page):
-    for _ in range(6):
-        page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-        page.wait_for_timeout(400)
-    page.evaluate("window.scrollTo(0, 0)")
-    page.wait_for_timeout(300)
+    # Single fast scroll to bottom and back — triggers all lazy loaders
+    page.evaluate("""
+        async () => {
+            const delay = ms => new Promise(r => setTimeout(r, ms));
+            const h = document.body.scrollHeight;
+            for (let y = 0; y < h; y += window.innerHeight * 3) {
+                window.scrollTo(0, y);
+                await delay(150);
+            }
+            window.scrollTo(0, 0);
+        }
+    """)
+    page.wait_for_timeout(200)
 
 # ---------------------------------------------------------------------------
 # Check for next page
@@ -416,6 +424,15 @@ def main():
         """)
         tab = context.new_page()
 
+        # Block images, CSS, fonts, media — we only need HTML/JSON
+        def block_heavy(route):
+            rt = route.request.resource_type
+            if rt in ("image", "font", "media", "stylesheet"):
+                route.abort()
+            else:
+                route.continue_()
+        tab.route("**/*", block_heavy)
+
         for i, url in enumerate(urls, 1):
             log.info("[%d/%d] %s", i, len(urls), url)
             pg = 1
@@ -432,10 +449,10 @@ def main():
 
                 # Wait for page to settle
                 try:
-                    tab.wait_for_load_state("networkidle", timeout=15000)
+                    tab.wait_for_load_state("networkidle", timeout=8000)
                 except Exception:
                     pass
-                tab.wait_for_timeout(2000)
+                tab.wait_for_timeout(500)
 
                 # Check if redirected to login
                 current = tab.url.lower()
@@ -462,7 +479,7 @@ def main():
                         btn = tab.query_selector(sel)
                         if btn and btn.is_visible():
                             btn.click()
-                            tab.wait_for_timeout(300)
+                            tab.wait_for_timeout(100)
                     except Exception:
                         pass
 
@@ -505,7 +522,7 @@ def main():
                     break
 
                 pg += 1
-                time.sleep(random.uniform(1, 3))
+                time.sleep(random.uniform(0.5, 1.5))
 
         context.close()
         browser.close()
