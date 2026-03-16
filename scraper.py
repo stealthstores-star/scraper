@@ -16,6 +16,8 @@ import argparse
 import csv
 import json
 import logging
+import math
+import os
 import random
 import re
 import sys
@@ -606,6 +608,127 @@ def main():
 
     csv_out.close()
     log.info("Done! %d products → %s", csv_out.count, out)
+
+    # -----------------------------------------------------------------------
+    # POST-PROCESSING PIPELINE
+    # -----------------------------------------------------------------------
+    post_process(out)
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: dedup titles → filter → split SAFE links
+# ---------------------------------------------------------------------------
+
+def post_process(csv_path):
+    """Remove duplicate titles, run eBay safety filter, split SAFE into 1500-line link CSVs."""
+    log.info("=" * 60)
+    log.info("POST-PROCESSING PIPELINE")
+    log.info("=" * 60)
+
+    # --- Step 1: Remove duplicate titles ---
+    log.info("Step 1: Removing duplicate titles...")
+    base = os.path.splitext(csv_path)[0]
+    deduped_path = f"{base}_deduped.csv"
+
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames)
+        rows = list(reader)
+
+    original_count = len(rows)
+    seen_titles = set()
+    unique_rows = []
+    for row in rows:
+        title = row.get("product_title", "").strip().lower()
+        if title and title not in seen_titles:
+            seen_titles.add(title)
+            unique_rows.append(row)
+        elif not title:
+            unique_rows.append(row)
+
+    with open(deduped_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(unique_rows)
+
+    dupes_removed = original_count - len(unique_rows)
+    log.info("  %d products → %d unique (%d duplicates removed)",
+             original_count, len(unique_rows), dupes_removed)
+    log.info("  Saved: %s", deduped_path)
+
+    # --- Step 2: Run eBay safety filter ---
+    log.info("Step 2: Running eBay UK safety filter...")
+    try:
+        # Import the filter from same directory
+        filter_dir = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, filter_dir)
+        import ebay_filter
+
+        stats, report = ebay_filter.process_csv(deduped_path)
+        t = max(stats["total"], 1)
+        log.info("  Total: %d", stats["total"])
+        log.info("  SAFE: %d (%.1f%%)", stats["safe"], stats["safe"] / t * 100)
+        log.info("  GREYLIST: %d (%.1f%%)", stats.get("greylist", 0), stats.get("greylist", 0) / t * 100)
+        log.info("  BLOCKED: %d (%.1f%%)", stats["blocked"], stats["blocked"] / t * 100)
+    except ImportError:
+        log.error("  ebay_filter.py not found in %s — skipping filter step.", filter_dir)
+        return
+    except Exception as e:
+        log.error("  Filter error: %s", e)
+        return
+
+    # --- Step 3: Split SAFE output into 1500-line link-only CSVs ---
+    log.info("Step 3: Splitting SAFE links into 1500-line CSV files...")
+    safe_csv = f"{base}_deduped_SAFE.csv"
+
+    if not os.path.exists(safe_csv):
+        log.warning("  SAFE CSV not found: %s", safe_csv)
+        return
+
+    # Read SAFE CSV and extract product_url column
+    with open(safe_csv, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        sf = list(reader.fieldnames) if reader.fieldnames else []
+        url_col = None
+        for col in sf:
+            if "url" in col.lower() and "image" not in col.lower() and "store" not in col.lower() and "source" not in col.lower():
+                url_col = col
+                break
+        if not url_col and "product_url" in sf:
+            url_col = "product_url"
+        if not url_col:
+            url_col = sf[0] if sf else None
+
+        links = []
+        f.seek(0)
+        reader = csv.DictReader(f)
+        for row in reader:
+            link = row.get(url_col, "").strip()
+            if link:
+                links.append(link)
+
+    if not links:
+        log.info("  No SAFE links to split.")
+        return
+
+    chunk_size = 1500
+    num_chunks = math.ceil(len(links) / chunk_size)
+    output_dir = os.path.dirname(csv_path) or "."
+
+    for i in range(num_chunks):
+        chunk = links[i * chunk_size : (i + 1) * chunk_size]
+        chunk_path = os.path.join(output_dir, f"{base}_SAFE_links_part{i + 1}.csv")
+        with open(chunk_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["product_url"])
+            for link in chunk:
+                w.writerow([link])
+        log.info("  Part %d: %d links → %s", i + 1, len(chunk), chunk_path)
+
+    log.info("Split %d SAFE links into %d files of up to %d each.", len(links), num_chunks, chunk_size)
+    log.info("=" * 60)
+    log.info("POST-PROCESSING COMPLETE")
+    log.info("=" * 60)
 
 
 if __name__ == "__main__":
