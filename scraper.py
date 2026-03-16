@@ -251,27 +251,49 @@ def click_next(page, current):
 # ---------------------------------------------------------------------------
 
 def is_captcha(tab):
-    """Check if the current page is showing a CAPTCHA."""
+    """Check if the current page is showing a CAPTCHA (including AliExpress slider)."""
     try:
         url = tab.url.lower()
         if "captcha" in url or "punch" in url or "sec.aliexpress" in url:
             return True
-        # Check page content for CAPTCHA indicators
+        # Check for common CAPTCHA / slider elements
+        for sel in [
+            "#captcha", "[class*='captcha']", "[class*='Captcha']",
+            "#nc_1_n1z", ".nc-container", "#baxia-dialog",
+            # AliExpress slider CAPTCHA
+            "#nc_1_wrapper", "#nc_1__scale_text", ".nc_wrapper",
+            ".nc-outer", "#nocaptcha", "[class*='nocaptcha']",
+            ".J_MIDDLEWARE_FRAME_WIDGET", "#J_suf498498498",
+            "iframe[src*='captcha']", "iframe[src*='punch']",
+            "iframe[src*='nocaptcha']", "iframe[src*='sec.aliexpress']",
+            # Generic slider
+            "[class*='slider-verify']", "[class*='SliderCaptcha']",
+            "[class*='slide-verify']", "[class*='smartCaptcha']",
+            "[id*='alicaptcha']", "[class*='alicaptcha']",
+        ]:
+            try:
+                el = tab.query_selector(sel)
+                if el and el.is_visible():
+                    return True
+            except Exception:
+                pass
+        # Also check iframes — slider CAPTCHA often loads in an iframe
+        for frame in tab.frames:
+            try:
+                frame_url = frame.url.lower()
+                if any(w in frame_url for w in ["captcha", "punch", "nocaptcha", "sec.aliexpress"]):
+                    return True
+            except Exception:
+                pass
+        # Check page content for CAPTCHA indicators (short pages only)
         body = tab.query_selector("body")
-        if not body:
-            return False
-        text = (body.inner_text() or "").strip()
-        # Only check short pages (CAPTCHAs have minimal text)
-        if len(text) < 500:
-            low = text.lower()
-            if any(w in low for w in ["captcha", "verify", "robot", "slider", "puzzle", "human"]):
-                return True
-        # Check for common CAPTCHA elements
-        for sel in ["#captcha", "[class*='captcha']", "[class*='Captcha']",
-                     "#nc_1_n1z", ".nc-container", ".slider", "#baxia-dialog"]:
-            el = tab.query_selector(sel)
-            if el and el.is_visible():
-                return True
+        if body:
+            text = (body.inner_text() or "").strip()
+            if len(text) < 500:
+                low = text.lower()
+                if any(w in low for w in ["captcha", "verify you are human", "robot",
+                                          "slide to verify", "puzzle", "drag the slider"]):
+                    return True
     except Exception:
         pass
     return False
