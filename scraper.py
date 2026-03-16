@@ -219,6 +219,7 @@ def click_next(tab, current):
     # First find pagination container to avoid clicking random links
     pagination = None
     for sel in ["[class*='pagination']", "[class*='Pagination']",
+                "[class*='comet-pagination']",
                 "nav[aria-label*='page']", "ul[class*='page']"]:
         try:
             el = tab.query_selector(sel)
@@ -233,7 +234,8 @@ def click_next(tab, current):
         # Try next-page button inside pagination
         for sel in ["[class*='next']:not([class*='disabled'])",
                      "button[aria-label='Next']", "a[class*='next']",
-                     "li.next a"]:
+                     "li.next a", "button[class*='next']",
+                     "[aria-label*='Next']", "a[rel='next']"]:
             try:
                 el = pagination.query_selector(sel)
                 if el and el.is_visible():
@@ -259,6 +261,7 @@ def click_next(tab, current):
     for sel in [
         ".comet-pagination-next:not(.comet-pagination-disabled)",
         f"a[href*='page={nxt}']",
+        "button[aria-label='Next page']",
     ]:
         try:
             els = tab.query_selector_all(sel)
@@ -588,8 +591,14 @@ def main():
 
                 # Try clicking next page button
                 if not click_next(tab, pg):
-                    log.info("  No next page — done.")
-                    break
+                    # Fallback: navigate directly to next page URL
+                    next_url = page_url(url, pg + 1)
+                    log.info("  click_next failed, trying URL: %s", next_url)
+                    try:
+                        tab.goto(next_url, wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        log.info("  No next page — done.")
+                        break
 
                 # Wait for new page to load
                 try:
