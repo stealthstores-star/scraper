@@ -211,36 +211,60 @@ def extract(page):
 # Pagination
 # ---------------------------------------------------------------------------
 
-def click_next(page, current):
+def click_next(tab, current):
     """Try to click the next page button. Returns True if clicked."""
     nxt = current + 1
-    # Try clicking a specific page number first
-    try:
-        els = page.query_selector_all(f"a:has-text('{nxt}'), button:has-text('{nxt}')")
-        for el in els:
-            if el.is_visible() and el.inner_text().strip() == str(nxt):
-                el.scroll_into_view_if_needed()
-                el.click()
-                page.wait_for_timeout(500)
-                return True
-    except Exception:
-        pass
-    # Try next-page selectors
+    # First find pagination container to avoid clicking random links
+    pagination = None
+    for sel in ["[class*='pagination']", "[class*='Pagination']",
+                "nav[aria-label*='page']", "ul[class*='page']"]:
+        try:
+            el = tab.query_selector(sel)
+            if el and el.is_visible():
+                pagination = el
+                break
+        except Exception:
+            pass
+
+    # If we found a pagination container, look for next button inside it
+    if pagination:
+        # Try next-page button inside pagination
+        for sel in ["[class*='next']:not([class*='disabled'])",
+                     "button[aria-label='Next']", "a[class*='next']",
+                     "li.next a"]:
+            try:
+                el = pagination.query_selector(sel)
+                if el and el.is_visible():
+                    el.scroll_into_view_if_needed()
+                    el.click()
+                    tab.wait_for_timeout(500)
+                    return True
+            except Exception:
+                pass
+        # Try specific page number inside pagination
+        try:
+            els = pagination.query_selector_all("a, button")
+            for el in els:
+                if el.is_visible() and el.inner_text().strip() == str(nxt):
+                    el.scroll_into_view_if_needed()
+                    el.click()
+                    tab.wait_for_timeout(500)
+                    return True
+        except Exception:
+            pass
+
+    # Fallback: try next-page selectors on the full page
     for sel in [
-        "a[class*='next']",
-        "button[aria-label='Next']",
         ".comet-pagination-next:not(.comet-pagination-disabled)",
-        "li.next a",
-        "[class*='pagination'] [class*='next']",
         f"a[href*='page={nxt}']",
     ]:
         try:
-            els = page.query_selector_all(sel)
+            els = tab.query_selector_all(sel)
             for el in els:
                 if el.is_visible():
                     el.scroll_into_view_if_needed()
                     el.click()
-                    page.wait_for_timeout(500)
+                    tab.wait_for_timeout(500)
                     return True
         except Exception:
             pass
@@ -299,6 +323,30 @@ def is_captcha(tab):
     return False
 
 
+def is_login(tab):
+    """Check if page is showing a login/sign-in page or overlay."""
+    try:
+        url = tab.url.lower()
+        if "login" in url or "passport" in url or "signin" in url:
+            return True
+        # Check for login overlay/modal on page
+        for sel in [
+            "input[type='password']",
+            "[class*='login-dialog']", "[class*='LoginDialog']",
+            "[class*='sign-in']", "[class*='SignIn']",
+            "form[action*='login']", "form[action*='signin']",
+        ]:
+            try:
+                el = tab.query_selector(sel)
+                if el and el.is_visible():
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
 def wait_ready(tab, target):
     """Wait for page to load, handle login redirects and CAPTCHAs."""
     # Wait for first product link to appear
@@ -307,37 +355,38 @@ def wait_ready(tab, target):
     except Exception:
         pass
 
-    # Check for login redirect
-    current = tab.url.lower()
-    if "login" in current or "passport" in current:
-        log.warning(">>> Login required! Log in in the browser window. <<<")
-        print("\a", flush=True)
-        while True:
-            tab.wait_for_timeout(1000)
-            current = tab.url.lower()
-            if "login" not in current and "passport" not in current:
-                log.info(">>> Login complete! Reloading target... <<<")
-                break
-        try:
-            tab.goto(target, wait_until="domcontentloaded", timeout=30000)
-            tab.wait_for_selector("a[href*='/item/']", timeout=5000)
-        except Exception:
-            pass
-        return True
+    # Loop to handle CAPTCHA → login → CAPTCHA chains
+    for _ in range(5):
+        # Check for login
+        if is_login(tab):
+            log.warning(">>> Sign in required! Log in in the browser window. <<<")
+            print("\a", flush=True)
+            while is_login(tab):
+                tab.wait_for_timeout(1000)
+            log.info(">>> Login complete! Reloading target... <<<")
+            try:
+                tab.goto(target, wait_until="domcontentloaded", timeout=30000)
+                tab.wait_for_selector("a[href*='/item/']", timeout=5000)
+            except Exception:
+                pass
+            continue  # Re-check in case CAPTCHA appears after login
 
-    # Check for CAPTCHA — wait for user to solve it
-    if is_captcha(tab):
-        log.warning(">>> CAPTCHA detected! Solve it in the browser window. <<<")
-        print("\a", flush=True)
-        while is_captcha(tab):
-            tab.wait_for_timeout(2000)
-        log.info(">>> CAPTCHA solved! Reloading target... <<<")
-        # Reload original target after CAPTCHA
-        try:
-            tab.goto(target, wait_until="domcontentloaded", timeout=30000)
-            tab.wait_for_selector("a[href*='/item/']", timeout=5000)
-        except Exception:
-            pass
+        # Check for CAPTCHA
+        if is_captcha(tab):
+            log.warning(">>> CAPTCHA detected! Solve it in the browser window. <<<")
+            print("\a", flush=True)
+            while is_captcha(tab):
+                tab.wait_for_timeout(2000)
+            log.info(">>> CAPTCHA solved! Reloading target... <<<")
+            try:
+                tab.goto(target, wait_until="domcontentloaded", timeout=30000)
+                tab.wait_for_selector("a[href*='/item/']", timeout=5000)
+            except Exception:
+                pass
+            continue  # Re-check in case login appears after CAPTCHA
+
+        # Neither login nor CAPTCHA — good to go
+        break
 
     return True
 
@@ -429,40 +478,84 @@ def main():
     log.info("Output: %s", out)
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-        )
-        context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        """)
-        tab = context.new_page()
+        browser = None
+        context = None
+        tab = None
+
+        def ensure_browser():
+            nonlocal browser, context, tab
+            try:
+                # Test if page is still alive
+                if tab:
+                    tab.url
+                    return
+            except Exception:
+                pass
+            # (Re)create browser
+            log.info("Opening browser...")
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+            try:
+                if browser:
+                    browser.close()
+            except Exception:
+                pass
+            browser = pw.chromium.launch(
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+            )
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            """)
+            tab = context.new_page()
 
         for i, url in enumerate(urls, 1):
             log.info("[%d/%d] %s", i, len(urls), url)
+
+            # Make sure browser is alive
+            ensure_browser()
 
             # Load first page
             try:
                 tab.goto(url, wait_until="domcontentloaded", timeout=30000)
             except Exception as e:
-                if is_captcha(tab):
-                    log.warning(">>> CAPTCHA detected! Solve it in the browser window. <<<")
-                    print("\a", flush=True)
-                    while is_captcha(tab):
-                        tab.wait_for_timeout(2000)
-                    log.info(">>> CAPTCHA solved! Reloading... <<<")
+                err = str(e).lower()
+                if "closed" in err or "crashed" in err:
+                    log.warning("  Browser closed — reopening...")
+                    tab = None
+                    ensure_browser()
                     try:
                         tab.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    except Exception:
-                        log.warning("  Load error after CAPTCHA: %s", e)
+                    except Exception as e2:
+                        log.warning("  Load error: %s", e2)
                         continue
                 else:
-                    log.warning("  Load error: %s", e)
-                    continue
+                    # Check for CAPTCHA
+                    try:
+                        if is_captcha(tab):
+                            log.warning(">>> CAPTCHA detected! Solve it in the browser window. <<<")
+                            print("\a", flush=True)
+                            while is_captcha(tab):
+                                tab.wait_for_timeout(2000)
+                            log.info(">>> CAPTCHA solved! Reloading... <<<")
+                            try:
+                                tab.goto(url, wait_until="domcontentloaded", timeout=30000)
+                            except Exception:
+                                log.warning("  Load error after CAPTCHA: %s", e)
+                                continue
+                        else:
+                            log.warning("  Load error: %s", e)
+                            continue
+                    except Exception:
+                        log.warning("  Load error: %s", e)
+                        continue
 
             pg = 1
             while pg <= 100:
@@ -505,8 +598,11 @@ def main():
                 pg += 1
                 time.sleep(random.uniform(0.2, 0.5))
 
-        context.close()
-        browser.close()
+        try:
+            context.close()
+            browser.close()
+        except Exception:
+            pass
 
     csv_out.close()
     log.info("Done! %d products → %s", csv_out.count, out)
