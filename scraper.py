@@ -211,31 +211,39 @@ def extract(page):
 # Pagination
 # ---------------------------------------------------------------------------
 
-def has_next(page, current):
+def click_next(page, current):
+    """Try to click the next page button. Returns True if clicked."""
     nxt = current + 1
+    # Try clicking a specific page number first
+    try:
+        els = page.query_selector_all(f"a:has-text('{nxt}'), button:has-text('{nxt}')")
+        for el in els:
+            if el.is_visible() and el.inner_text().strip() == str(nxt):
+                el.scroll_into_view_if_needed()
+                el.click()
+                page.wait_for_timeout(500)
+                return True
+    except Exception:
+        pass
+    # Try next-page selectors
     for sel in [
-        f"a[href*='page={nxt}']",
         "a[class*='next']",
         "button[aria-label='Next']",
         ".comet-pagination-next:not(.comet-pagination-disabled)",
         "li.next a",
         "[class*='pagination'] [class*='next']",
+        f"a[href*='page={nxt}']",
     ]:
         try:
             els = page.query_selector_all(sel)
             for el in els:
                 if el.is_visible():
+                    el.scroll_into_view_if_needed()
+                    el.click()
+                    page.wait_for_timeout(500)
                     return True
         except Exception:
             pass
-    # Check for page number link
-    try:
-        els = page.query_selector_all(f"a:has-text('{nxt}'), button:has-text('{nxt}')")
-        for el in els:
-            if el.is_visible() and el.inner_text().strip() == str(nxt):
-                return True
-    except Exception:
-        pass
     return False
 
 # ---------------------------------------------------------------------------
@@ -414,34 +422,32 @@ def main():
 
         for i, url in enumerate(urls, 1):
             log.info("[%d/%d] %s", i, len(urls), url)
-            pg = 1
 
+            # Load first page
+            try:
+                tab.goto(url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                if is_captcha(tab):
+                    log.warning(">>> CAPTCHA detected! Solve it in the browser window. <<<")
+                    print("\a", flush=True)
+                    while is_captcha(tab):
+                        tab.wait_for_timeout(2000)
+                    log.info(">>> CAPTCHA solved! Reloading... <<<")
+                    try:
+                        tab.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        log.warning("  Load error after CAPTCHA: %s", e)
+                        continue
+                else:
+                    log.warning("  Load error: %s", e)
+                    continue
+
+            pg = 1
             while pg <= 100:
-                target = page_url(url, pg) if pg > 1 else url
                 log.info("  Page %d", pg)
 
-                # Load page
-                try:
-                    tab.goto(target, wait_until="domcontentloaded", timeout=30000)
-                except Exception as e:
-                    # Check if we landed on a CAPTCHA or login page
-                    if is_captcha(tab):
-                        log.warning(">>> CAPTCHA detected! Solve it in the browser window. <<<")
-                        print("\a", flush=True)
-                        while is_captcha(tab):
-                            tab.wait_for_timeout(2000)
-                        log.info(">>> CAPTCHA solved! Reloading... <<<")
-                        try:
-                            tab.goto(target, wait_until="domcontentloaded", timeout=30000)
-                        except Exception:
-                            log.warning("  Load error after CAPTCHA: %s", e)
-                            break
-                    else:
-                        log.warning("  Load error: %s", e)
-                        break
-
                 # Wait for content, handle login/captcha
-                wait_ready(tab, target)
+                wait_ready(tab, url)
 
                 # Dismiss popups
                 dismiss_popups(tab)
@@ -453,12 +459,26 @@ def main():
                     log.info("  No products on page %d — done.", pg)
                     break
 
+                prev_total = csv_out.count
                 csv_out.add(products, url)
-                log.info("  Page %d: %d products (total: %d)", pg, len(products), csv_out.count)
+                new_count = csv_out.count - prev_total
+                log.info("  Page %d: %d products, %d new (total: %d)", pg, len(products), new_count, csv_out.count)
 
-                if not has_next(tab, pg):
+                # If page had zero new products, pagination is looping — stop
+                if new_count == 0 and pg > 1:
+                    log.info("  No new products — done with this URL.")
+                    break
+
+                # Try clicking next page button
+                if not click_next(tab, pg):
                     log.info("  No next page — done.")
                     break
+
+                # Wait for new page to load
+                try:
+                    tab.wait_for_selector("a[href*='/item/']", timeout=5000)
+                except Exception:
+                    pass
 
                 pg += 1
                 time.sleep(random.uniform(0.2, 0.5))
