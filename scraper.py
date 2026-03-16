@@ -213,66 +213,87 @@ def extract(page):
 # Pagination
 # ---------------------------------------------------------------------------
 
+CLICK_NEXT_JS = """
+(targetPage) => {
+    // Helper: scroll element into view and click it
+    function clickEl(el) {
+        el.scrollIntoView({block: 'center'});
+        el.click();
+        return true;
+    }
+
+    // Strategy 1: Find a "next" button/link in any pagination-like container
+    const paginationEls = document.querySelectorAll(
+        '[class*="pagination"], [class*="Pagination"], nav[aria-label*="page"], [class*="comet-pagination"]'
+    );
+    for (const pg of paginationEls) {
+        // Look for next button
+        const nextBtns = pg.querySelectorAll(
+            '[class*="next"]:not([class*="disabled"]):not([disabled]), ' +
+            'button[aria-label="Next"], a[rel="next"], ' +
+            '[aria-label*="Next"], button[aria-label="Next page"]'
+        );
+        for (const btn of nextBtns) {
+            if (btn.offsetParent !== null) return clickEl(btn);
+        }
+        // Look for specific page number
+        const allBtns = pg.querySelectorAll('a, button, span[role="button"], li');
+        for (const btn of allBtns) {
+            const txt = (btn.innerText || '').trim();
+            if (txt === String(targetPage) && btn.offsetParent !== null) {
+                return clickEl(btn);
+            }
+        }
+    }
+
+    // Strategy 2: Look anywhere on page for next-page controls
+    const globalNextSels = [
+        '.comet-pagination-next:not(.comet-pagination-disabled)',
+        'button[class*="next"]:not([disabled])',
+        'a[class*="next"]',
+        '[aria-label*="Next"]',
+        'a[rel="next"]',
+    ];
+    for (const sel of globalNextSels) {
+        const els = document.querySelectorAll(sel);
+        for (const el of els) {
+            if (el.offsetParent !== null) return clickEl(el);
+        }
+    }
+
+    // Strategy 3: Find any element with the target page number near bottom of page
+    const allEls = document.querySelectorAll('a, button, span[role="button"]');
+    const pageH = document.body.scrollHeight;
+    for (const el of allEls) {
+        const txt = (el.innerText || '').trim();
+        const rect = el.getBoundingClientRect();
+        // Must be near bottom half of viewport, text matches page number, and is visible
+        if (txt === String(targetPage) && el.offsetParent !== null && rect.top > 200) {
+            // Verify it looks like pagination (small element, not a product card)
+            if (rect.width < 200 && rect.height < 100) {
+                return clickEl(el);
+            }
+        }
+    }
+
+    return false;
+}
+"""
+
+
 def click_next(tab, current):
-    """Try to click the next page button. Returns True if clicked."""
+    """Try to click the next page button using in-browser JS. Returns True if clicked."""
     nxt = current + 1
-    # First find pagination container to avoid clicking random links
-    pagination = None
-    for sel in ["[class*='pagination']", "[class*='Pagination']",
-                "[class*='comet-pagination']",
-                "nav[aria-label*='page']", "ul[class*='page']"]:
-        try:
-            el = tab.query_selector(sel)
-            if el and el.is_visible():
-                pagination = el
-                break
-        except Exception:
-            pass
-
-    # If we found a pagination container, look for next button inside it
-    if pagination:
-        # Try next-page button inside pagination
-        for sel in ["[class*='next']:not([class*='disabled'])",
-                     "button[aria-label='Next']", "a[class*='next']",
-                     "li.next a", "button[class*='next']",
-                     "[aria-label*='Next']", "a[rel='next']"]:
-            try:
-                el = pagination.query_selector(sel)
-                if el and el.is_visible():
-                    el.scroll_into_view_if_needed()
-                    el.click()
-                    tab.wait_for_timeout(500)
-                    return True
-            except Exception:
-                pass
-        # Try specific page number inside pagination
-        try:
-            els = pagination.query_selector_all("a, button")
-            for el in els:
-                if el.is_visible() and el.inner_text().strip() == str(nxt):
-                    el.scroll_into_view_if_needed()
-                    el.click()
-                    tab.wait_for_timeout(500)
-                    return True
-        except Exception:
-            pass
-
-    # Fallback: try next-page selectors on the full page
-    for sel in [
-        ".comet-pagination-next:not(.comet-pagination-disabled)",
-        f"a[href*='page={nxt}']",
-        "button[aria-label='Next page']",
-    ]:
-        try:
-            els = tab.query_selector_all(sel)
-            for el in els:
-                if el.is_visible():
-                    el.scroll_into_view_if_needed()
-                    el.click()
-                    tab.wait_for_timeout(500)
-                    return True
-        except Exception:
-            pass
+    try:
+        # Scroll to bottom first so pagination elements are rendered
+        tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        tab.wait_for_timeout(500)
+        result = tab.evaluate(CLICK_NEXT_JS, nxt)
+        if result:
+            tab.wait_for_timeout(500)
+            return True
+    except Exception:
+        pass
     return False
 
 # ---------------------------------------------------------------------------
@@ -591,14 +612,8 @@ def main():
 
                 # Try clicking next page button
                 if not click_next(tab, pg):
-                    # Fallback: navigate directly to next page URL
-                    next_url = page_url(url, pg + 1)
-                    log.info("  click_next failed, trying URL: %s", next_url)
-                    try:
-                        tab.goto(next_url, wait_until="domcontentloaded", timeout=30000)
-                    except Exception:
-                        log.info("  No next page — done.")
-                        break
+                    log.info("  No next page — done.")
+                    break
 
                 # Wait for new page to load
                 try:
